@@ -167,7 +167,7 @@ def load_or_precompute(model, dataset, batch_size, device,
         ys_raw = np.load(f'{cache_path}_ys.npy')
         if ys_raw.ndim == 3:
             print(f'  [cache] loading {cache_path}_*.npy')
-            embs      = torch.from_numpy(np.load(f'{cache_path}_embs.npy'))
+            embs      = torch.from_numpy(np.load(f'{cache_path}_embs.npy', mmap_mode='r'))
             decisions = torch.from_numpy(np.load(f'{cache_path}_decisions.npy'))
             lead2     = (torch.from_numpy(np.load(lead2_path))
                          if os.path.exists(lead2_path) else None)
