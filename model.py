@@ -12,9 +12,9 @@ import torch.nn.functional as F
 
 
 class _Positive(nn.Module):
-    """Parametrization that constrains a weight tensor to be strictly positive via softplus."""
+    """Parametrization that constrains a weight tensor to be non-negative via abs."""
     def forward(self, x):
-        return F.softplus(x)
+        return x.abs()
 
 
 class MaskHead(nn.Module):
@@ -36,7 +36,7 @@ class MaskHead(nn.Module):
       sigmoid → mask
     """
 
-    def __init__(self, embed_dim=768, window_size=None, width=128):
+    def __init__(self, embed_dim=768, window_size=None, width=128, monotone_fusion=False):
         # width is accepted for API compatibility but unused
         super().__init__()
         if window_size is None:
@@ -44,13 +44,15 @@ class MaskHead(nn.Module):
             window_size = WINDOW_PRE + WINDOW_POST
         self.window_size = window_size
 
+        self.time_attn = nn.Parameter(torch.zeros(38))  # learned logits over t (HuBERT outputs 38 steps for 2500-sample input)
+
         self.compress = nn.Sequential(
             nn.Conv2d(embed_dim, 1024, kernel_size=1),
             nn.BatchNorm2d(1024),
             nn.GELU(),                                                            # (N, 1024, 12, t)
 
             nn.Conv2d(1024, 512, kernel_size=1), nn.GELU(),                        # (N, 512, 12, t)
-            
+
             nn.Conv2d(512, 128, kernel_size=(1, 7), padding=(0, 3), groups=128), nn.GELU(),  # (N, 128, 12, t)
             nn.Conv2d(128, 64,  kernel_size=(1, 7), padding=(0, 3), groups=64),  nn.GELU(),  # (N, 64,  12, t)
             nn.Conv2d(64,  32,  kernel_size=(1, 7), padding=(0, 3), groups=32),  nn.GELU(),  # (N, 32,  12, t)
@@ -74,6 +76,10 @@ class MaskHead(nn.Module):
             nn.Conv1d(128, 64, kernel_size=7, padding=3), nn.GELU(),
             nn.Conv1d(64, 1, kernel_size=1),                 # (N, 1, 550) logits — QRS only
         )
+        if monotone_fusion:
+            for m in self.fusion.modules():
+                if isinstance(m, nn.Conv1d):
+                    nn.utils.parametrize.register_parametrization(m, 'weight', _Positive())
 
         # ablation flags
         self.ablate_embedding = False
@@ -87,6 +93,8 @@ class MaskHead(nn.Module):
         g = x.permute(0, 3, 1, 2)          # (N, D, L, t) = (N, 768, 12, 96)
         if self.ablate_embedding:
             g = torch.zeros_like(g)
+        t_weights = torch.softmax(self.time_attn, dim=0)  # (t,)
+        g = g * t_weights.view(1, 1, 1, -1)               # (N, D, L, t)
         g = self.compress(g)                # (N, 1, 1, t)
         g = g.squeeze(2)                    # (N, 1, t)
         g = F.interpolate(g, size=self.window_size,
@@ -113,7 +121,7 @@ class MaskHead(nn.Module):
         
         mu  = g.mean(dim=-1, keepdim=True)
         std = g.std(dim=-1, keepdim=True).clamp(min=1e-6)
-        g = (g ) / std   
+        g = (g -mu) / std   
         
 
         

@@ -61,8 +61,7 @@ def emb_cache_path(cache_dir, folders, tag):
 
 
 def _embs_exist(base):
-    """True if an embs file exists in either format (.pt preferred, .npy legacy)."""
-    return os.path.exists(f'{base}_embs.pt') or os.path.exists(f'{base}_embs.npy')
+    return os.path.exists(f'{base}_embs.npy')
 
 
 def _emb_cache_exists(base):
@@ -78,20 +77,12 @@ def _unann_cache_exists(base):
 
 
 def _load_embs(base):
-    """Load embs tensor. Prefers .pt; auto-migrates .npy → .pt on first access."""
-    pt_path  = f'{base}_embs.pt'
-    npy_path = f'{base}_embs.npy'
-    if os.path.exists(pt_path):
-        return torch.load(pt_path, weights_only=True)
-    print(f'  [cache] migrating {os.path.basename(npy_path)} → .pt (faster future loads)')
-    t = torch.from_numpy(np.load(npy_path))
-    torch.save(t, pt_path)
-    return t
+    arr = np.load(f'{base}_embs.npy')   # mmap: avoids 9 GB upfront spike
+    return torch.from_numpy(arr)
 
 
 def _save_embs(base, tensor):
-    """Save embs tensor as .pt."""
-    torch.save(tensor, f'{base}_embs.pt')
+    np.save(f'{base}_embs.npy', tensor.numpy())
 
 
 def _ys_valid(base):
@@ -99,7 +90,7 @@ def _ys_valid(base):
     path = f'{base}_ys.npy'
     if not os.path.exists(path):
         return False
-    return np.load(path, mmap_mode='r').ndim == 3
+    return np.load(path).ndim == 3
 
 
 # =========================================================
@@ -386,3 +377,16 @@ def build_sample_data(head, splits, device):
 def tv_loss(logits):
     """Total variation of logits along the time axis — penalises jagged masks."""
     return (logits[:, :, 1:] - logits[:, :, :-1]).abs().mean()
+
+
+def dur_prior_loss(dur, mu, delta):
+    """Dead-zone duration prior: zero penalty within ±delta ms of mu, quadratic beyond.
+
+    Parameters
+    ----------
+    dur   : (N,) predicted soft durations in ms
+    mu    : scalar — mean QRS duration from annotated ground truth
+    delta : scalar — tolerance half-width in ms (default 100 ms)
+    """
+    excess = (dur - mu).abs() - delta
+    return F.relu(excess).pow(2).mean()
