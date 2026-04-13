@@ -68,8 +68,10 @@ class MaskHead(nn.Module):
 
         # ── fusion ────────────────────────────────────────────────────
         self.fusion = nn.Sequential(
-            nn.Conv1d(2, 64, kernel_size=7, padding=3), nn.GELU(),
-            nn.Conv1d(64, 64, kernel_size=7, padding=3), nn.GELU(),
+            nn.Conv1d(2, 128, kernel_size=7, padding=3), nn.GELU(),
+            nn.Conv1d(128, 256, kernel_size=7, padding=3), nn.GELU(),
+            nn.Conv1d(256, 128, kernel_size=7, padding=3), nn.GELU(),
+            nn.Conv1d(128, 64, kernel_size=7, padding=3), nn.GELU(),
             nn.Conv1d(64, 1, kernel_size=1),                 # (N, 1, 550) logits — QRS only
         )
 
@@ -100,6 +102,11 @@ class MaskHead(nn.Module):
             d = torch.zeros_like(d)
         
         f = d#self.pt_mlp(d)                  # (N, 1, 550)
+
+
+
+
+
         mu  = d.mean(dim=-1, keepdim=True)
         std = d.std(dim=-1, keepdim=True).clamp(min=1e-6)
         f = (d - mu) / std   
@@ -109,7 +116,11 @@ class MaskHead(nn.Module):
         g = (g ) / std   
         
 
+        
         logits =self.fusion(torch.cat([g, f], dim=1))  # (N, 1, 550)
+        
+        
+        
         mask   = torch.sigmoid(logits)
 
         return logits, mask, mask.sum(dim=-1), f, g

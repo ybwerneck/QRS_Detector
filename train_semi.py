@@ -28,7 +28,7 @@ from train_utils import (
     emb_cache_path, _emb_cache_exists, _unann_cache_exists, _ys_valid,
     load_or_build_model, load_or_precompute, load_or_precompute_unann,
     collect_predictions, build_sample_data,
-    tv_loss,
+    tv_loss, dur_prior_loss,
 )
 
 
@@ -37,7 +37,8 @@ from train_utils import (
 # =========================================================
 
 def run_epoch(head, ann_loader, unann_iter, optimizer, device,
-              train=True, scaler=None, lambda_tv_ann=0.2, lambda_tv_unann=1.0):
+              train=True, scaler=None, lambda_tv_ann=0.2, lambda_tv_unann=1.0,
+              lambda_dur=0.0, ann_dur_mu=None, dur_delta=100.0):
     head.train(train)
     total_bce = total_qrs = n = 0
 
@@ -54,9 +55,12 @@ def run_epoch(head, ann_loader, unann_iter, optimizer, device,
                         + lambda_tv_ann * tv_loss(logits))
                 if train:
                     u_emb, u_d = next(unann_iter)
-                    u_logits, _, _ = head(u_emb.to(device, non_blocking=True),
-                                         u_d.to(device,  non_blocking=True))
+                    u_logits, u_mask, u_dur = head(u_emb.to(device, non_blocking=True),
+                                                   u_d.to(device,  non_blocking=True))
                     loss = loss + lambda_tv_unann * tv_loss(u_logits)
+                    if lambda_dur > 0.0 and ann_dur_mu is not None:
+                        loss = loss + lambda_dur * dur_prior_loss(
+                            u_dur[:, 0], ann_dur_mu, dur_delta)
                     optimizer.zero_grad()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
@@ -167,6 +171,13 @@ def main(args):
     print(f'Train / Val / Holdout ({holdout_pat}) / Unannotated : '
           f'{n_train} / {n_val} / {len(holdout_full_ds)} / {len(unann_full_ds)}')
 
+    # Annotated QRS duration distribution (ground truth mask sums, ms)
+    ann_qrs_dur = ys[:, 0, :].sum(dim=-1).float()
+    ann_dur_mu  = ann_qrs_dur.mean().item()
+    print(f'Annotated QRS dur  mean={ann_dur_mu:.1f} ms  '
+          f'std={ann_qrs_dur.std().item():.1f} ms  '
+          f'dead-zone ±{args.dur_delta:.0f} ms')
+
     train_dl   = DataLoader(train_ds,        batch_size=args.batch_size, shuffle=True,  pin_memory=True)
     val_dl     = DataLoader(val_ds,          batch_size=args.batch_size, shuffle=False, pin_memory=True)
     holdout_dl = DataLoader(holdout_full_ds, batch_size=args.batch_size, shuffle=False, pin_memory=True)
@@ -207,6 +218,9 @@ def main(args):
             train=True, scaler=scaler,
             lambda_tv_ann=args.lambda_tv_ann,
             lambda_tv_unann=args.lambda_tv_unann,
+            lambda_dur=args.lambda_dur,
+            ann_dur_mu=ann_dur_mu,
+            dur_delta=args.dur_delta,
         )
         va_bce, va_qrs, va_qt = run_epoch(
             model.head, val_dl, unann_iter, optimizer, device, train=False)
@@ -286,7 +300,11 @@ if __name__ == '__main__':
                         help='recompute and overwrite all caches')
     parser.add_argument('--lambda_tv_ann',    type=float, default=1.0,
                         help='TV weight on annotated batches')
-    parser.add_argument('--lambda_tv_unann',  type=float, default=10.0,
+    parser.add_argument('--lambda_tv_unann',  type=float, default=0.5,
                         help='TV weight on unannotated batches (continuity constraint)')
+    parser.add_argument('--lambda_dur',       type=float, default=0.0,
+                        help='weight for duration prior loss on unannotated beats')
+    parser.add_argument('--dur_delta',        type=float, default=100.0,
+                        help='dead-zone half-width in ms (no penalty within ±dur_delta of annotated mean)')
     args = parser.parse_args()
     main(args)
