@@ -11,12 +11,9 @@ Usage:
 """
 
 import os
-import sys
 import glob
-import pickle
+import shutil
 import itertools
-import subprocess
-import tempfile
 import argparse
 import numpy as np
 import torch
@@ -26,201 +23,21 @@ from tqdm import tqdm
 
 from beat import load_or_process_beats
 from dataset import BeatDataset, preprocess_hubert
-from model import build_model
-
-
-# =========================================================
-# Non-blocking plot dispatch
-# =========================================================
-
-_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_plot_worker.py')
-_plot_procs: list = []
-
-
-def _prune_procs():
-    global _plot_procs
-    _plot_procs = [p for p in _plot_procs if p.poll() is None]
-
-
-def dispatch_debug_plot(**kwargs):
-    _prune_procs()
-    fd, tmp_path = tempfile.mkstemp(suffix='.pkl')
-    with os.fdopen(fd, 'wb') as f:
-        pickle.dump(kwargs, f)
-    proc = subprocess.Popen([sys.executable, _WORKER, tmp_path])
-    _plot_procs.append(proc)
-    tqdm.write(f'  [plot] dispatched epoch {kwargs.get("epoch", 0)} → {kwargs.get("out_dir", "debug")}')
-
-
-# =========================================================
-# Embedding cache helpers  (shared format with train.py)
-# =========================================================
-
-def emb_cache_path(cache_dir, folders, tag):
-    key = '_'.join(sorted(os.path.basename(f) for f in folders))
-    return os.path.join(cache_dir, f'emb_{tag}_{key}')
-
-
-def _emb_cache_exists(base):
-    return all(os.path.exists(f'{base}_{s}.npy') for s in ('embs', 'decisions', 'ys'))
-
-
-def _unann_cache_exists(base):
-    return all(os.path.exists(f'{base}_{s}.npy') for s in ('embs', 'decisions'))
-
-
-def _ys_valid(base):
-    path = f'{base}_ys.npy'
-    if not os.path.exists(path):
-        return False
-    return np.load(path, mmap_mode='r').ndim == 3
-
-
-# =========================================================
-# Model / head loading
-# =========================================================
-
-class _ModelWithHead:
-    """Head-only wrapper used when the encoder output is fully cached."""
-    def __init__(self, head):
-        self.head = head
-
-
-def load_or_build_model(cache_dir, force, device, width,
-                        train_folders, holdout_folders):
-    train_cp   = emb_cache_path(cache_dir, train_folders,   'train')
-    holdout_cp = emb_cache_path(cache_dir, holdout_folders, 'holdout')
-    unann_cp   = emb_cache_path(cache_dir, train_folders,   'unann')
-    cfg_path   = os.path.join(cache_dir, 'model_config.pt')
-
-    all_cached = (
-        not force
-        and _emb_cache_exists(train_cp)
-        and _emb_cache_exists(holdout_cp)
-        and _unann_cache_exists(unann_cp)
-        and os.path.exists(cfg_path)
-    )
-
-    if all_cached:
-        cfg = torch.load(cfg_path, map_location='cpu', weights_only=True)
-        print(f'  [cache] skipping HuBERT load — building head from {cfg_path}')
-        from beat import WINDOW_PRE, WINDOW_POST
-        from model import MaskHead
-        head = MaskHead(
-            embed_dim=cfg['embed_dim'],
-            window_size=WINDOW_PRE + WINDOW_POST,
-            width=width,
-        ).to(device)
-        return _ModelWithHead(head)
-
-    model, _ = build_model(device=device, width=width)
-    os.makedirs(cache_dir, exist_ok=True)
-    torch.save(
-        dict(embed_dim=model.encoder.config.hidden_size,
-             embed_L=model.L,
-             embed_t=model.t),
-        cfg_path,
-    )
-    return model
-
-
-# =========================================================
-# Precompute helpers
-# =========================================================
-
-@torch.no_grad()
-def precompute_embeddings(model, dataset, batch_size, device, desc=''):
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
-                        num_workers=4, pin_memory=True)
-    embs, decisions, ys = [], [], []
-    model.eval()
-    for x, d, y in tqdm(loader, desc=desc, leave=False):
-        x = x.to(device, non_blocking=True)
-        embs.append(model.encode(x).cpu())
-        decisions.append(d)
-        ys.append(y)
-    lead2 = torch.from_numpy(
-        np.stack([b.window[2, :].astype(np.float32) for b in dataset.beats])
-    )
-    return torch.cat(embs), torch.cat(decisions), torch.cat(ys), lead2
-
-
-@torch.no_grad()
-def precompute_embeddings_unann(model, dataset, batch_size, device, desc=''):
-    """Like precompute_embeddings but skips ys (unannotated beats have no labels)."""
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
-                        num_workers=4, pin_memory=True)
-    embs, decisions = [], []
-    model.eval()
-    for x, d, _y in tqdm(loader, desc=desc, leave=False):
-        x = x.to(device, non_blocking=True)
-        embs.append(model.encode(x).cpu())
-        decisions.append(d)
-    return torch.cat(embs), torch.cat(decisions)
-
-
-def load_or_precompute(model, dataset, batch_size, device,
-                       cache_path, force=False, desc=''):
-    lead2_path = f'{cache_path}_lead2.npy'
-
-    if not force and _emb_cache_exists(cache_path):
-        ys_raw = np.load(f'{cache_path}_ys.npy')
-        if ys_raw.ndim == 3:
-            print(f'  [cache] loading {cache_path}_*.npy')
-            embs      = torch.from_numpy(np.load(f'{cache_path}_embs.npy'))
-            decisions = torch.from_numpy(np.load(f'{cache_path}_decisions.npy'))
-            lead2     = (torch.from_numpy(np.load(lead2_path))
-                         if os.path.exists(lead2_path) else None)
-            return embs, decisions, torch.from_numpy(ys_raw), lead2
-
-        print(f'  [cache] stale ys — rebuilding from dataset (no re-encoding)')
-        embs      = torch.from_numpy(np.load(f'{cache_path}_embs.npy'))
-        decisions = torch.from_numpy(np.load(f'{cache_path}_decisions.npy'))
-        ys = torch.stack([dataset[i][2] for i in range(len(dataset))])
-        np.save(f'{cache_path}_ys.npy', ys.numpy())
-        lead2 = (torch.from_numpy(np.load(lead2_path))
-                 if os.path.exists(lead2_path) else None)
-        return embs, decisions, ys, lead2
-
-    embs, decisions, ys, lead2 = precompute_embeddings(
-        model, dataset, batch_size, device, desc=desc)
-    os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
-    np.save(f'{cache_path}_embs.npy',      embs.numpy())
-    np.save(f'{cache_path}_decisions.npy', decisions.numpy())
-    np.save(f'{cache_path}_ys.npy',        ys.numpy())
-    np.save(lead2_path,                    lead2.numpy())
-    print(f'  [cache] saved {cache_path}_*.npy')
-    return embs, decisions, ys, lead2
-
-
-def load_or_precompute_unann(model, dataset, batch_size, device,
-                             cache_path, force=False, desc=''):
-    if not force and _unann_cache_exists(cache_path):
-        print(f'  [cache] loading {cache_path}_embs/decisions.npy')
-        embs      = torch.from_numpy(np.load(f'{cache_path}_embs.npy'))
-        decisions = torch.from_numpy(np.load(f'{cache_path}_decisions.npy'))
-        return embs, decisions
-
-    embs, decisions = precompute_embeddings_unann(
-        model, dataset, batch_size, device, desc=desc)
-    os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
-    np.save(f'{cache_path}_embs.npy',      embs.numpy())
-    np.save(f'{cache_path}_decisions.npy', decisions.numpy())
-    print(f'  [cache] saved {cache_path}_embs/decisions.npy')
-    return embs, decisions
+from train_utils import (
+    dispatch_debug_plot,
+    emb_cache_path, _emb_cache_exists, _unann_cache_exists, _ys_valid,
+    load_or_build_model, load_or_precompute, load_or_precompute_unann,
+    collect_predictions, build_sample_data,
+    tv_loss,
+)
 
 
 # =========================================================
 # Train / eval
 # =========================================================
 
-def tv(logits):
-    """Total variation of logits along the time axis."""
-    return (logits[:, :, 1:] - logits[:, :, :-1]).abs().mean()
-
-
 def run_epoch(head, ann_loader, unann_iter, optimizer, device,
-              train=True, scaler=None, lambda_tv_ann=1.0, lambda_tv_unann=10.0):
+              train=True, scaler=None, lambda_tv_ann=0.2, lambda_tv_unann=1.0):
     head.train(train)
     total_bce = total_qrs = n = 0
 
@@ -230,37 +47,16 @@ def run_epoch(head, ann_loader, unann_iter, optimizer, device,
             d      = d.to(device, non_blocking=True)
             y_mask = y_mask.to(device, non_blocking=True)
 
-            if train and scaler is not None:
-                with torch.autocast(device_type=device.type):
-                    logits, mask, _ = head(emb, d)
-                    loss_ann = (F.binary_cross_entropy_with_logits(logits, y_mask[:, 0:1, :])
-                                + lambda_tv_ann * tv(logits))
 
-                    # unannotated batch — TV constraint only
-                    u_emb, u_d = next(unann_iter)
-                    u_emb = u_emb.to(device, non_blocking=True)
-                    u_d   = u_d.to(device, non_blocking=True)
-                    u_logits, _, _ = head(u_emb, u_d)
-                    loss_unann = lambda_tv_unann * tv(u_logits)
-
-                    loss = loss_ann + loss_unann
-
-                optimizer.zero_grad()
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
+            if(True):
                 logits, mask, _ = head(emb, d)
-                loss = F.binary_cross_entropy_with_logits(
-                    logits, y_mask[:, 0:1, :], reduction='sum')
+                loss = (F.binary_cross_entropy_with_logits(logits, y_mask[:, 0:1, :])
+                        + lambda_tv_ann * tv_loss(logits))
                 if train:
                     u_emb, u_d = next(unann_iter)
-                    u_emb = u_emb.to(device, non_blocking=True)
-                    u_d   = u_d.to(device, non_blocking=True)
-                    u_logits, _, _ = head(u_emb, u_d)
-                    loss = loss + lambda_tv_unann * tv(u_logits)
+                    u_logits, _, _ = head(u_emb.to(device, non_blocking=True),
+                                         u_d.to(device,  non_blocking=True))
+                    loss = loss + lambda_tv_unann * tv_loss(u_logits)
                     optimizer.zero_grad()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
@@ -277,49 +73,6 @@ def run_epoch(head, ann_loader, unann_iter, optimizer, device,
             n         += B
 
     return total_bce / n, total_qrs / n, 0.0
-
-
-@torch.no_grad()
-def collect_predictions(head, loader, device):
-    head.eval()
-    preds, targets = [], []
-    for emb, d, y_mask in loader:
-        emb    = emb.to(device, non_blocking=True)
-        d      = d.to(device, non_blocking=True)
-        y_mask = y_mask.to(device, non_blocking=True)
-        _, mask, _ = head(emb, d)
-        hard_dur = (mask > 0.5).float().sum(dim=-1)
-        pad = torch.zeros_like(hard_dur)
-        preds.append(torch.cat([hard_dur, pad], dim=-1).cpu())
-        targets.append(y_mask.sum(dim=-1).cpu())
-    return torch.cat(preds).numpy(), torch.cat(targets).numpy()
-
-
-@torch.no_grad()
-def pick_best_worst(head, emb, decision, y_mask, device):
-    head.eval()
-    _, mask, _ = head(emb.to(device), decision.to(device))
-    hard_dur = (mask > 0.5).float().sum(dim=-1)
-    gt_dur   = y_mask[:, 0, :].float().sum(dim=-1)
-    err      = (hard_dur[:, 0] - gt_dur.to(device)).abs()
-    return err.argmin().item(), err.argmax().item()
-
-
-@torch.no_grad()
-def collect_sample_logits(head, emb, decision, y_mask, lead2, device):
-    head.eval()
-    emb      = emb.to(device)
-    decision = decision.to(device)
-    logits, mask, _, f_sig, g_sig = head.forward_debug(emb, decision)
-    return {
-        'logits':   logits.cpu().numpy(),
-        'mask':     mask.cpu().numpy(),
-        'f_sig':    f_sig.cpu().numpy(),
-        'g_sig':    g_sig.cpu().numpy(),
-        'decision': decision.cpu().numpy(),
-        'y_mask':   y_mask.numpy(),
-        'lead2':    lead2.numpy() if lead2 is not None else None,
-    }
 
 
 # =========================================================
@@ -344,14 +97,13 @@ def main(args):
     holdout_cp = emb_cache_path(args.cache_dir, holdout_folders, 'holdout')
     unann_cp   = emb_cache_path(args.cache_dir, train_folders,   'unann')
 
-    need_ann_beats = (args.force
-                      or not (_emb_cache_exists(train_cp) and _emb_cache_exists(holdout_cp))
-                      or not (_ys_valid(train_cp) and _ys_valid(holdout_cp)))
+    need_ann_beats   = (args.force
+                        or not (_emb_cache_exists(train_cp) and _emb_cache_exists(holdout_cp))
+                        or not (_ys_valid(train_cp) and _ys_valid(holdout_cp)))
     need_unann_beats = args.force or not _unann_cache_exists(unann_cp)
-    need_beats = need_ann_beats or need_unann_beats
 
     train_ann_ds = holdout_ds = train_unann_ds = None
-    if need_beats:
+    if need_ann_beats or need_unann_beats:
         print('Loading / processing beats...')
         train_ann, train_unann, _ = load_or_process_beats(train_folders,   args.cache_dir, args.force)
         holdout_ann, _, _         = load_or_process_beats(holdout_folders, args.cache_dir, args.force)
@@ -366,20 +118,15 @@ def main(args):
     else:
         print('  [cache] all embeddings found — skipping beat load')
 
-    # ----------------------------------------------------------
-    # Model
-    # ----------------------------------------------------------
     print('Building model (or loading head from cache)...')
     model = load_or_build_model(
         args.cache_dir, args.force, device, args.width,
         train_folders, holdout_folders,
+        extra_caches=(unann_cp,),
     )
 
-    # ----------------------------------------------------------
-    # Annotated embeddings
-    # ----------------------------------------------------------
     print('Precomputing annotated embeddings (or loading from cache)...')
-    embs, decisions, ys, _lead2 = load_or_precompute(
+    embs, decisions, ys, lead2 = load_or_precompute(
         model, train_ann_ds, args.batch_size, device,
         cache_path=train_cp, force=args.force, desc='  train  ',
     )
@@ -388,9 +135,6 @@ def main(args):
         cache_path=holdout_cp, force=args.force, desc='  holdout',
     )
 
-    # ----------------------------------------------------------
-    # Unannotated embeddings
-    # ----------------------------------------------------------
     print('Precomputing unannotated embeddings (or loading from cache)...')
     unann_embs, unann_decisions = load_or_precompute_unann(
         model, train_unann_ds, args.batch_size, device,
@@ -410,9 +154,6 @@ def main(args):
         )
         np.save(f'{holdout_cp}_lead2.npy', ho_lead2.numpy())
 
-    # ----------------------------------------------------------
-    # Datasets / loaders
-    # ----------------------------------------------------------
     full_ds = TensorDataset(embs, decisions, ys)
     n_val   = max(1, int(len(full_ds) * args.val_split))
     n_train = len(full_ds) - n_val
@@ -429,15 +170,11 @@ def main(args):
     train_dl   = DataLoader(train_ds,        batch_size=args.batch_size, shuffle=True,  pin_memory=True)
     val_dl     = DataLoader(val_ds,          batch_size=args.batch_size, shuffle=False, pin_memory=True)
     holdout_dl = DataLoader(holdout_full_ds, batch_size=args.batch_size, shuffle=False, pin_memory=True)
-    unann_dl   = DataLoader(unann_full_ds,   batch_size=args.batch_size, shuffle=True,  pin_memory=True)
-    unann_iter = itertools.cycle(unann_dl)
-
-    # ----------------------------------------------------------
-    # Optimiser + scheduler
-    # ----------------------------------------------------------
-    optimizer = torch.optim.AdamW(
-        model.head.parameters(), lr=args.lr, weight_decay=args.wd,
+    unann_iter = itertools.cycle(
+        DataLoader(unann_full_ds, batch_size=args.batch_size, shuffle=True, pin_memory=True)
     )
+
+    optimizer = torch.optim.AdamW(model.head.parameters(), lr=args.lr, weight_decay=args.wd)
     warmup_epochs = max(1, args.epochs // 10)
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer,
@@ -454,7 +191,6 @@ def main(args):
     os.makedirs(args.ckpt_dir, exist_ok=True)
     debug_dir = args.plots_dir if args.plots_dir else os.path.join(args.ckpt_dir, 'debug')
     if os.path.isdir(debug_dir):
-        import shutil
         try:
             shutil.rmtree(debug_dir)
         except OSError:
@@ -495,41 +231,24 @@ def main(args):
         )
 
         if args.plot_every > 0 and (epoch % args.plot_every == 0 or epoch == args.epochs):
+            tr_idx = torch.tensor(train_ds.indices)
+            va_idx = torch.tensor(val_ds.indices)
             plot_data = {
                 'train':   collect_predictions(model.head, train_dl,   device),
                 'val':     collect_predictions(model.head, val_dl,     device),
                 'holdout': collect_predictions(model.head, holdout_dl, device),
             }
-            tr_idx = torch.tensor(train_ds.indices)
-            va_idx = torch.tensor(val_ds.indices)
-            _splits = [
+            sample_data, labels = build_sample_data(model.head, [
                 ('train',   embs[tr_idx], decisions[tr_idx], ys[tr_idx],
-                 _lead2[tr_idx] if _lead2 is not None else None),
+                 lead2[tr_idx] if lead2 is not None else None),
                 ('val',     embs[va_idx], decisions[va_idx], ys[va_idx],
-                 _lead2[va_idx] if _lead2 is not None else None),
+                 lead2[va_idx] if lead2 is not None else None),
                 ('holdout', ho_embs, ho_decisions, ho_ys, ho_lead2),
-            ]
-            _parts, _labels = [], []
-            for _name, _e, _d, _y, _l2 in _splits:
-                _bi, _wi = pick_best_worst(model.head, _e, _d, _y, device)
-                for _i, _tag in ((_bi, 'best'), (_wi, 'worst')):
-                    _l2_sel = _l2[[_i]] if _l2 is not None else None
-                    _parts.append(collect_sample_logits(
-                        model.head, _e[[_i]], _d[[_i]], _y[[_i]], _l2_sel, device))
-                    _labels.append(f'{_name} ({_tag})')
-            _keys = ['logits', 'mask', 'f_sig', 'g_sig', 'decision', 'y_mask']
-            sample_data = {k: np.concatenate([p[k] for p in _parts], axis=0) for k in _keys}
-            _l2_parts = [p['lead2'] for p in _parts]
-            sample_data['lead2'] = (
-                np.concatenate(_l2_parts, axis=0)
-                if all(x is not None for x in _l2_parts) else None
-            )
-            sample_data['labels'] = _labels
+            ], device)
+            sample_data['labels'] = labels
             dispatch_debug_plot(
-                epoch=epoch,
-                history=history,
-                plot_data=plot_data,
-                sample_data=sample_data,
+                epoch=epoch, history=history,
+                plot_data=plot_data, sample_data=sample_data,
                 out_dir=debug_dir,
             )
 
