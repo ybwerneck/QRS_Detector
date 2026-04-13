@@ -90,12 +90,14 @@ def load_or_build_model(cache_dir, force, device, width,
                         train_folders, holdout_folders):
     train_cp   = emb_cache_path(cache_dir, train_folders,   'train')
     holdout_cp = emb_cache_path(cache_dir, holdout_folders, 'holdout')
+    unann_cp   = emb_cache_path(cache_dir, train_folders,   'unann')
     cfg_path   = os.path.join(cache_dir, 'model_config.pt')
 
     all_cached = (
         not force
         and _emb_cache_exists(train_cp)
         and _emb_cache_exists(holdout_cp)
+        and _unann_cache_exists(unann_cp)
         and os.path.exists(cfg_path)
     )
 
