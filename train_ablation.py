@@ -274,9 +274,11 @@ def main(args):
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
+    plots_base = args.plots_dir if args.plots_dir else os.path.join(args.ckpt_dir, 'debug')
+
     # Wipe debug folders so each run starts clean
     for v in VARIANTS:
-        debug_dir = os.path.join(args.ckpt_dir, 'debug', v['name'])
+        debug_dir = os.path.join(plots_base, v['name'])
         if os.path.isdir(debug_dir):
             shutil.rmtree(debug_dir)
 
@@ -337,7 +339,7 @@ def main(args):
                         'val':     va_pt[n],
                         'holdout': ho_pt[n],
                     },
-                    out_dir=os.path.join(args.ckpt_dir, 'debug', n),
+                    out_dir=os.path.join(plots_base, n),
                     zero_emb=v['zero_emb'],
                     zero_dec=v['zero_dec'],
                 )
@@ -367,6 +369,8 @@ if __name__ == '__main__':
     parser.add_argument('--holdout_patient',  type=str,   default='p9')
     parser.add_argument('--log_every',   type=int, default=10)
     parser.add_argument('--plot_every',  type=int, default=50)
+    parser.add_argument('--plots_dir',   default=None,
+                        help='output folder for debug plots (default: <ckpt_dir>/debug)')
     parser.add_argument('--cache_dir',   default='cache',
                         help='directory for precomputed embedding caches')
     parser.add_argument('--force',       action='store_true',

@@ -32,17 +32,23 @@ def plot_signal_windows(signal_1d, beats, t_start=0, t_end=5000,
     ax_sig.set_title(f'Lead II  —  spike + window markers  [{t_start}–{t_end} ms]')
 
     sorted_beats = sorted(beats, key=lambda b: b.spike_idx)
-    prev_win_hi  = 0
     for b in sorted_beats:
-        win_lo = max(b.spike_idx - b.window_pre, prev_win_hi)  # borrowed region, but no overlap with prev
+        win_lo = b.spike_idx - b.window_pre
         win_hi = b.spike_idx + b.window_post
-        prev_win_hi = win_hi
         if win_lo >= t_end or win_hi <= t_start:
             continue
         lo = max(win_lo, t_start)
         hi = min(win_hi, t_end)
-        ax_sig.axvspan(lo, hi, color='grey', alpha=0.15)
-        ax_sig.axvline(b.spike_idx, color='red', linewidth=0.8, alpha=0.7)
+        ax_sig.axvspan(lo, hi, color='steelblue', alpha=0.08)
+        # window boundaries
+        if win_lo >= t_start:
+            ax_sig.axvline(win_lo, color='steelblue', linewidth=0.8,
+                           linestyle='-.', alpha=0.6)
+        if win_hi <= t_end:
+            ax_sig.axvline(win_hi, color='steelblue', linewidth=0.8,
+                           linestyle='--', alpha=0.6)
+        # spike
+        ax_sig.axvline(b.spike_idx, color='red', linewidth=1.0, alpha=0.8)
 
     if decision is not None:
         ax_dec = axes[1]

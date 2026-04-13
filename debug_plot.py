@@ -1,14 +1,12 @@
 """Debug plotting hook — called periodically during training.
 
-Called as:
-    debug_plot(epoch=..., history=..., plot_data=..., out_dir=...)
+Each call creates a per-epoch subfolder:
+    out_dir/epoch_NNNN/
+        predictions.png   — scatter + error histograms
+        loss_curves.png   — QRS / QT / BCE evolution across datasets
+        logits.png        — raw logit curves for 2 validation samples
 
-plot_data : dict with keys 'train', 'val', 'holdout'
-            Each value is a (preds_np, targets_np) tuple of shape (N, 2).
-            Predictions are already computed with the correct ablation masking.
-
-All arguments are passed as kwargs so new ones can be added freely without
-changing the call site. Each sub-plot routine picks what it needs.
+All arguments are passed as kwargs so new ones can be added freely.
 """
 
 import os
@@ -16,44 +14,17 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 
 
 # =========================================================
-# Sub-plot routines
+# Scatter — pred vs target
 # =========================================================
-
-def _plot_loss_curves(history, ax_qrs, ax_qt, **kwargs):
-    """Train / val / holdout MAE curves for QRS and QT."""
-    if not history:
-        return
-    epochs  = [r['epoch']   for r in history]
-    tr_qrs  = [r['tr_qrs']  for r in history]
-    va_qrs  = [r['va_qrs']  for r in history]
-    ho_qrs  = [r['ho_qrs']  for r in history]
-    tr_qt   = [r['tr_qt']   for r in history]
-    va_qt   = [r['va_qt']   for r in history]
-    ho_qt   = [r['ho_qt']   for r in history]
-
-    for ax, tr, va, ho, label in [
-        (ax_qrs, tr_qrs, va_qrs, ho_qrs, 'QRS MAE (ms)'),
-        (ax_qt,  tr_qt,  va_qt,  ho_qt,  'QT MAE (ms)'),
-    ]:
-        ax.plot(epochs, tr, label='train', color='steelblue')
-        ax.plot(epochs, va, label='val',   color='darkorange')
-        ax.plot(epochs, ho, label='holdout', color='seagreen', linestyle='--')
-        ax.set_yscale('log')
-        ax.set_ylabel(label, fontsize=8)
-        ax.set_ylim(bottom=1, top=2e2)
-        ax.set_xlabel('Epoch', fontsize=8)
-        ax.legend(fontsize=7)
-        ax.grid(alpha=0.25, which='both')
-
 
 def _plot_pred_vs_target(ax_qrs, ax_qt, plot_data=None, **kwargs):
-    """Scatter of predictions vs targets on the validation set."""
     if plot_data is None or 'val' not in plot_data:
         return
-    preds, targets = plot_data['val']   # numpy (N, 2) each
+    preds, targets = plot_data['val']
 
     for ax, col, label in [
         (ax_qrs, 0, 'QRS (ms)'),
@@ -73,17 +44,16 @@ def _plot_pred_vs_target(ax_qrs, ax_qt, plot_data=None, **kwargs):
         ax.grid(alpha=0.2)
 
 
-def _plot_error_histograms(ax_qrs, ax_qt, plot_data=None, **kwargs):
-    """Overlaid error histograms for train / val / holdout, per output.
+# =========================================================
+# Error histograms
+# =========================================================
 
-    Bins: uniform 5 ms steps from -50 to +50, plus one overflow bin on each
-    side for errors outside that range.  Y-axis is linear.
-    """
+def _plot_error_histograms(ax_qrs, ax_qt, plot_data=None, **kwargs):
     if plot_data is None:
         return
 
-    BIN_STEP = 5
-    CLIP     = 50
+    BIN_STEP  = 5
+    CLIP      = 50
     bin_edges = np.concatenate([
         [-CLIP - BIN_STEP],
         np.arange(-CLIP, CLIP + 1, BIN_STEP),
@@ -101,7 +71,7 @@ def _plot_error_histograms(ax_qrs, ax_qt, plot_data=None, **kwargs):
         if name not in plot_data:
             continue
         preds, targets = plot_data[name]
-        errs = preds - targets   # (N, 2)
+        errs = preds - targets
         for col in (0, 1):
             e = errs[:, col]
             e = e[~np.isnan(e)]
@@ -127,7 +97,7 @@ def _plot_error_histograms(ax_qrs, ax_qt, plot_data=None, **kwargs):
             ax.axvline(np.clip(e.mean(), bin_edges[0], bin_edges[-1]),
                        color=color, linewidth=1.0, linestyle='--')
 
-        ax.axvline(0, color='black', linewidth=0.8, linestyle='-')
+        ax.axvline(0, color='black', linewidth=0.8)
         ax.set_ylim(0, y_max)
 
         tick_pos    = (bin_edges[:-1] + bin_edges[1:]) / 2
@@ -136,7 +106,6 @@ def _plot_error_histograms(ax_qrs, ax_qt, plot_data=None, **kwargs):
                       [f'≥{CLIP}']
         ax.set_xticks(tick_pos)
         ax.set_xticklabels(tick_labels, fontsize=6, rotation=45, ha='right')
-
         ax.set_xlabel(f'Error {label}  (pred − target)', fontsize=8)
         ax.set_ylabel('Count', fontsize=8)
         ax.set_title(f'Error distribution — {label}', fontsize=9)
@@ -145,61 +114,204 @@ def _plot_error_histograms(ax_qrs, ax_qt, plot_data=None, **kwargs):
 
 
 # =========================================================
-# Registry — add new routines here
+# Loss evolution (NEW)
 # =========================================================
 
-# Each entry: (n_rows, n_cols, callable)
-# The callable receives all axes for its panel + all kwargs.
-_PANELS = [
-    # (rows, cols, fn)
-    (1, 2, _plot_loss_curves),       # axes: ax_qrs, ax_qt
-    (1, 2, _plot_pred_vs_target),    # axes: ax_qrs, ax_qt
-    (1, 2, _plot_error_histograms),  # axes: ax_qrs, ax_qt
-]
+def _plot_loss_evolution(history, **kwargs):
+    """Three-panel figure: QRS MAE / QT MAE / BCE across train, val, holdout."""
+    if not history:
+        return None
+
+    epochs = [r['epoch'] for r in history]
+
+    panels = [
+        ('QRS MAE (ms)', 'tr_qrs', 'va_qrs', 'ho_qrs'),
+        ('QT MAE (ms)',  'tr_qt',  'va_qt',  'ho_qt'),
+    ]
+    if 'tr_bce' in history[0]:
+        panels.append(('BCE', 'tr_bce', 'va_bce', 'ho_bce'))
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 4))
+    if len(panels) == 1:
+        axes = [axes]
+
+    colors  = {'train': 'steelblue', 'val': 'darkorange', 'holdout': 'seagreen'}
+    lstyles = {'train': '-',         'val': '-',           'holdout': '--'}
+
+    for ax, (title, tr_key, va_key, ho_key) in zip(axes, panels):
+        for split, key, color in [
+            ('train',   tr_key, colors['train']),
+            ('val',     va_key, colors['val']),
+            ('holdout', ho_key, colors['holdout']),
+        ]:
+            vals = [r[key] for r in history]
+            ax.plot(epochs, vals, color=color, linestyle=lstyles[split], label=split)
+
+        ax.set_yscale('log')
+        ax.set_xlabel('Epoch', fontsize=8)
+        ax.set_ylabel(title, fontsize=8)
+        ax.set_title(title, fontsize=9)
+        ax.legend(fontsize=7)
+        ax.grid(alpha=0.25, which='both')
+
+    fig.suptitle('Loss evolution', fontsize=10)
+    plt.tight_layout()
+    return fig
+
+
+# =========================================================
+# Sample logits (NEW)
+# =========================================================
+
+def _plot_sample_logits(sample_data=None, **kwargs):
+    """N×3 grid: for each sample — lead II + GT | f & g branches | final logit + mask."""
+    if sample_data is None:
+        return None
+
+    logits   = sample_data['logits']    # (N, 1, 550)
+    mask     = sample_data['mask']      # (N, 1, 550)
+    f_sig    = sample_data['f_sig']     # (N, 1, 550)
+    g_sig    = sample_data['g_sig']     # (N, 1, 550)
+    y_mask   = sample_data['y_mask']    # (N, 2, 550)
+    lead2    = sample_data.get('lead2') # (N, 550) or None
+
+    labels = sample_data.get('labels')  # list of str or None
+    n = len(logits)
+    t = np.arange(logits.shape[-1])
+
+    fig, axes = plt.subplots(n, 3, figsize=(18, 4 * n))
+    if n == 1:
+        axes = axes[np.newaxis, :]
+
+    for i in range(n):
+        gt  = y_mask[i, 0]          # QRS GT mask
+        mk  = mask[i, 0]
+        lg  = logits[i, 0]
+        f   = f_sig[i, 0]
+        g   = g_sig[i, 0]
+
+        pred_dur = mk.sum()
+        gt_dur   = gt.sum()
+        row_label = labels[i] if labels is not None else f'sample {i+1}'
+
+        # ── col 0: lead II + GT ───────────────────────────────────
+        ax = axes[i, 0]
+        if lead2 is not None:
+            sig   = lead2[i]
+            sig_n = (sig - sig.mean()) / (sig.std() + 1e-8)
+            ax.plot(t, sig_n, color='#333333', linewidth=0.8, label='lead II')
+        else:
+            ax.text(0.5, 0.5, 'lead2 unavailable', transform=ax.transAxes,
+                    ha='center', va='center', fontsize=8, color='grey')
+        ax2 = ax.twinx()
+        ax2.fill_between(t, 0, gt, color='seagreen', alpha=0.25, label='GT')
+        ax2.set_ylim(-0.1, 1.5)
+        ax2.set_yticks([])
+        ax.set_ylabel('lead II (norm)', fontsize=7)
+        ax.set_xlabel('time (ms)', fontsize=7)
+        ax.tick_params(labelsize=6)
+        ax.set_title(f'{row_label} — lead II', fontsize=8)
+        ax.grid(alpha=0.15)
+        handles = []
+        if lead2 is not None:
+            handles.append(plt.Line2D([0], [0], color='#333333', label='lead II'))
+        handles.append(Patch(color='seagreen', alpha=0.4, label='GT QRS'))
+        ax.legend(handles=handles, fontsize=7, loc='upper right')
+
+        # ── col 1: f (PT branch) and g (EMB branch) ──────────────
+        ax = axes[i, 1]
+        ax.fill_between(t, 0, gt, color='seagreen', alpha=0.15)
+        ax.plot(t, f, color='steelblue',  linewidth=1.0, label='f  (PT branch)')
+        ax.plot(t, g, color='darkorange', linewidth=1.0, label='g  (EMB branch)')
+        #ax.set_ylim(-2, 2)
+        ax.set_ylabel('sigmoid output', fontsize=7)
+        ax.set_xlabel('time (ms)', fontsize=7)
+        ax.tick_params(labelsize=6)
+        ax.set_title(f'{row_label} — branch priors', fontsize=8)
+        ax.legend(fontsize=7, loc='upper right')
+        ax.grid(alpha=0.2)
+
+        # ── col 2: final logit + predicted mask ───────────────────
+        ax = axes[i, 2]
+        ax2 = ax.twinx()
+        ax2.fill_between(t, 0, gt, color='seagreen', alpha=0.2, zorder=1)
+        ax2.plot(t, mk, color='darkorange', linewidth=1.0, zorder=2, label='mask')
+        ax2.set_ylim(-0.05, 1.3)
+        ax2.set_ylabel('mask / GT', fontsize=7, color='darkorange')
+        ax2.tick_params(labelsize=6, colors='darkorange')
+        ax.plot(t, lg, color='steelblue', linewidth=1.2, zorder=3, label='logit')
+        ax.axhline(0, color='steelblue', linewidth=0.5, linestyle=':', alpha=0.5)
+        ax.set_ylabel('logit', fontsize=7, color='steelblue')
+        ax.set_xlabel('time (ms)', fontsize=7)
+        ax.tick_params(labelsize=6, colors='steelblue')
+        ax.set_title(
+            f'{row_label} — fusion  '
+            f'pred={pred_dur:.1f} ms  gt={gt_dur:.0f} ms  err={pred_dur-gt_dur:+.1f} ms',
+            fontsize=8,
+        )
+        ax.grid(alpha=0.2, zorder=0)
+        handles = [
+            plt.Line2D([0], [0], color='steelblue',  label='logit'),
+            plt.Line2D([0], [0], color='darkorange', label='pred mask'),
+            Patch(color='seagreen', alpha=0.4,       label='GT'),
+        ]
+        ax.legend(handles=handles, fontsize=7, loc='upper right')
+
+    fig.suptitle('Sample debug — lead II / branch priors / fusion', fontsize=10)
+    plt.tight_layout()
+    return fig
 
 
 # =========================================================
 # Main hook
 # =========================================================
 
-
 def debug_plot(**kwargs):
-    """Call from the training loop.  Saves to out_dir/debug_<epoch>.png.
+    """Render plots into two levels of out_dir.
+
+    out_dir/                  ← run-level: plots that accumulate over time
+        loss_curves.png           overwritten on every tick
+
+    out_dir/epoch_NNNN/       ← epoch-level: per-snapshot plots
+        predictions.png           scatter + error histograms
+        logits.png                sample logit curves
 
     Expected kwargs
     ---------------
-    epoch     : int
-    history   : list[dict]  — each dict has keys epoch/tr_qrs/va_qrs/ho_qrs/tr_qt/va_qt/ho_qt
-    plot_data : dict        — keys 'train'/'val'/'holdout', values (preds_np, targets_np) (N,2)
-    out_dir   : str         (default 'debug')
+    epoch       : int
+    history     : list[dict]
+    plot_data   : dict  — keys 'train'/'val'/'holdout', values (preds_np, targets_np) (N,2)
+    sample_data : dict  — keys 'logits','mask','y_mask','decision', arrays (N,2,550)/(N,550)
+    out_dir     : str
     """
-    epoch   = kwargs.get('epoch', 0)
-    out_dir = kwargs.get('out_dir', 'debug')
-    os.makedirs(out_dir, exist_ok=True)
+    epoch    = kwargs.get('epoch', 0)
+    out_dir  = kwargs.get('out_dir', 'debug')
+    step_dir = os.path.join(out_dir, f'epoch_{epoch:04d}')
+    os.makedirs(out_dir,  exist_ok=True)
+    os.makedirs(step_dir, exist_ok=True)
 
-    n_panels = len(_PANELS)
-    fig, axes = plt.subplots(n_panels, 2, figsize=(12, n_panels * 4))
-    if n_panels == 1:
-        axes = axes[np.newaxis, :]
+    # ── run-level: loss evolution (overwritten each tick) ─────────
+    fig = _plot_loss_evolution(**kwargs)
+    if fig is not None:
+        fig.savefig(os.path.join(out_dir, 'loss_curves.png'), dpi=120, bbox_inches='tight')
+        plt.close(fig)
 
-    for row, (_, _, fn) in enumerate(_PANELS):
-        ax_left, ax_right = axes[row, 0], axes[row, 1]
+    # ── epoch-level: scatter + histograms ─────────────────────────
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    for row, fn in enumerate([_plot_pred_vs_target, _plot_error_histograms]):
         try:
-            fn(ax_qrs=ax_left, ax_qt=ax_right, **kwargs)
+            fn(ax_qrs=axes[row, 0], ax_qt=axes[row, 1], **kwargs)
         except Exception as e:
-            ax_left.set_title(f'{fn.__name__} error: {e}', fontsize=7, color='red')
-
-    zero_emb = kwargs.get('zero_emb', False)
-    zero_dec = kwargs.get('zero_dec', False)
-    variant  = os.path.basename(kwargs.get('out_dir', 'debug').rstrip('/'))
-    ablation = ('full' if not zero_emb and not zero_dec
-                else 'emb_only' if not zero_emb and zero_dec
-                else 'dec_only' if zero_emb and not zero_dec
-                else 'none')
-    fig.suptitle(f'{variant}  —  epoch {epoch}  |  ablation={ablation}  '
-                 f'(zero_emb={zero_emb}, zero_dec={zero_dec})', fontsize=10)
+            axes[row, 0].set_title(f'{fn.__name__} error: {e}', fontsize=7, color='red')
+    fig.suptitle(f'epoch {epoch}', fontsize=10)
     plt.tight_layout()
-    path = os.path.join(out_dir, f'debug_{epoch:04d}.png')
-    plt.savefig(path, dpi=120, bbox_inches='tight')
+    fig.savefig(os.path.join(step_dir, 'predictions.png'), dpi=120, bbox_inches='tight')
     plt.close(fig)
-    return path
+
+    # ── epoch-level: sample logits ────────────────────────────────
+    fig = _plot_sample_logits(**kwargs)
+    if fig is not None:
+        fig.savefig(os.path.join(step_dir, 'logits.png'), dpi=120, bbox_inches='tight')
+        plt.close(fig)
+
+    return step_dir

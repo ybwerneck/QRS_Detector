@@ -19,3 +19,26 @@ ECG QRS and QT interval regression using a frozen HuBERT-ECG-base encoder.
 - New-patient holdout: degrades (expected — patient generalization deferred to Phase 1/2)
 
 **Conclusion:** representational capacity confirmed; decision signal carries temporal structure; ready for logit head.
+
+---
+
+# Phase 2 — Logit Mask Head
+
+Replaced scalar regression with a **soft mask** over the beat window: the model now predicts a per-ms probability and the duration is the sum of the mask.
+
+## Architecture
+
+- **g path (compressor):** `(N, 12, t, 768)` → depthwise Conv2d stack with learned lead-collapse → `(N, 1, 550)`, z-scored
+- **f path (PT anchor):** z-scored Pan-Tompkins decision signal `(N, 1, 550)` — directly anchors the mask to beat structure
+- **Fusion:** `cat[g, f]` → Conv1d × 3 → logits `(N, 1, 550)` → sigmoid → mask; duration = mask.sum()
+- **Loss:** BCE on ground-truth rectangular mask + MAE regularisation
+
+## Phase 2 Results (epoch 10 000)
+
+| Split | QRS MAE | QT MAE |
+|---|---|---|
+| Train | 0.0 ms | 0.0 ms |
+| Val | 17.9 ms | 0.0 ms |
+| Holdout (p9) | 22.9 ms | 0.0 ms |
+
+**Conclusion:** mask head achieves near-zero train error; PT anchor provides strong temporal signal; val/holdout generalisation competitive with Phase 0 scalar head.

@@ -1,8 +1,22 @@
-__pycache__/
-*.pyc
+# Data and caches
 cache/
-ckpts/
-ckpts_ablation/
 data/
 bkup/
+
+# Checkpoints
+ckpts/
+ckpts_ablation/
+
+# Generated plots
 *.png
+debug/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pkl
+*.npy
+*.pt
+
+# Misc
+.DS_Store

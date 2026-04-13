@@ -5,14 +5,15 @@ import torch
 from torch.utils.data import Dataset
 from scipy.signal import resample
 
-from beat import FS, Beat
+from beat import FS, Beat, WINDOW_PRE, WINDOW_POST
+
+WINDOW_SIZE = WINDOW_PRE + WINDOW_POST   # 550
 
 # =========================================================
 # HuBERT-ECG target spec
 # =========================================================
 HUBERT_FS        = 500    # Hz — model input sample rate
 HUBERT_N_SAMPLES = 2500   # samples (5 seconds)
-HUBERT_LEAD_IDX  = 0      # Lead I
 
 
 def preprocess_hubert(context_window):
@@ -28,9 +29,45 @@ def preprocess_hubert(context_window):
     leads = []
     for lead in context_window:
         resampled = resample(lead, HUBERT_N_SAMPLES).astype(np.float32)
-        leads.append(resampled)
+        mu = resampled.mean()
+        std = resampled.std()
+        leads.append((resampled - mu) / (std + 1e-6))
 
     return np.stack(leads, axis=0)[:-1, :]  # drop VD d → (12, 2500)
+
+
+# =========================================================
+# Mask builder
+# =========================================================
+
+def build_mask(beat):
+    """Build a (2, WINDOW_SIZE) float32 binary mask from beat annotations.
+
+    Channel 0: QRS interval  [qrs_start, qrs_start + qrs_duration)
+    Channel 1: QT  interval  [qt_start,  qt_start  + qt_interval)
+
+    All positions are in ms (= samples at 1 kHz), clipped to [0, WINDOW_SIZE).
+    Summing along the last axis gives duration in ms.
+    """
+    mask         = np.zeros((2, WINDOW_SIZE), dtype=np.float32)
+    window_start = beat.spike_idx - beat.window_pre   # absolute ms of window[0]
+
+    if beat.qrs_start is not None and beat.qrs_duration is not None:
+        lo = int(round(beat.qrs_start))    - window_start
+        hi = lo + int(round(beat.qrs_duration))
+        lo, hi = max(0, lo), min(WINDOW_SIZE, hi)
+        if lo < hi:
+            mask[0, lo:hi] = 1.0
+
+    if beat.qt_start is not None and beat.qt_interval is not None:
+        lo = int(round(beat.qt_start))     - window_start
+        hi = lo + int(round(beat.qt_interval))
+        lo, hi = max(0, lo), min(WINDOW_SIZE, hi)
+        if lo < hi:
+            mask[1, lo:hi] = 1.0
+
+    return mask
+
 
 # =========================================================
 # Dataset
@@ -41,21 +78,30 @@ class BeatDataset(Dataset):
 
     Parameters
     ----------
-    beats       : list[Beat]
-    transform   : callable | None
-        Applied to each window (np.ndarray) before converting to tensor.
+    beats        : list[Beat]
+    transform    : callable | None
+        Applied to each context window before converting to tensor.
         Pass `preprocess_hubert` to use HuBERT-ECG formatting.
-        None uses the raw window as-is.
     require_both : bool
         If True (default), only beats with both qrs_duration and qt_interval
-        are included.  Set False to include beats with partial / no labels
-        (targets will be NaN).
+        are included.
     """
 
     def __init__(self, beats, transform=None, require_both=True):
         if require_both:
             beats = [b for b in beats
                      if b.qrs_duration is not None and b.qt_interval is not None]
+            # Drop beats where the QRS mask sum differs from the annotation by
+            # more than 10% — catches T-wave misdetections and heavily clipped beats.
+            def _mask_ok(b):
+                m = build_mask(b)
+                qrs_sum = m[0].sum()
+                return qrs_sum >= 0.9 * b.qrs_duration
+            n_before = len(beats)
+            beats = [b for b in beats if _mask_ok(b)]
+            dropped = n_before - len(beats)
+            if dropped:
+                print(f'  [dataset] dropped {dropped} beat(s) with clipped/mismatched QRS mask')
         self.beats     = beats
         self.transform = transform
 
@@ -70,11 +116,8 @@ class BeatDataset(Dataset):
             window = self.transform(window)
 
         x = torch.from_numpy(window)
-        d = torch.from_numpy(beat.decision_window)   # (WINDOW_PRE+WINDOW_POST,)
-
-        qrs = beat.qrs_duration if beat.qrs_duration is not None else float('nan')
-        qt  = beat.qt_interval  if beat.qt_interval  is not None else float('nan')
-        y   = torch.tensor([qrs, qt], dtype=torch.float32)
+        d = torch.from_numpy(beat.decision_window)          # (W,)
+        y = torch.from_numpy(build_mask(beat))              # (2, W)
 
         return x, d, y
 
@@ -89,16 +132,13 @@ if __name__ == '__main__':
 
     beats, _, _ = process_study('data/p21/ecg_data.txt')
 
-    print('--- Raw dataset ---')
-    ds_raw = BeatDataset(beats)
-    x, y   = ds_raw[0]
-    print(f'  x shape : {tuple(x.shape)}   y : {y}')
-
     print('--- HuBERT dataset ---')
-    ds_hub = BeatDataset(beats, transform=preprocess_hubert)
-    x, d, y = ds_hub[0]
-    print(f'  x shape : {tuple(x.shape)}   d shape : {tuple(d.shape)}   y : {y}')
+    ds = BeatDataset(beats, transform=preprocess_hubert)
+    x, d, y = ds[0]
+    print(f'  x : {tuple(x.shape)}')
+    print(f'  d : {tuple(d.shape)}')
+    print(f'  y : {tuple(y.shape)}  qrs={y[0].sum():.0f}ms  qt={y[1].sum():.0f}ms')
 
-    dl = DataLoader(ds_hub, batch_size=4, shuffle=True)
+    dl = DataLoader(ds, batch_size=4, shuffle=True)
     xb, db, yb = next(iter(dl))
-    print(f'  batch x : {tuple(xb.shape)}   batch d : {tuple(db.shape)}   batch y : {tuple(yb.shape)}')
+    print(f'  batch x:{tuple(xb.shape)}  d:{tuple(db.shape)}  y:{tuple(yb.shape)}')

@@ -1,185 +1,142 @@
-"""ECG regression model — HuBERT-ECG encoder + MLP regression head.
+"""ECG mask model — HuBERT-ECG encoder + compressor/fusion head.
 
 Input  : (N, 12, 2500)  — 12-lead, 500 Hz, 5-second tiled window
-Output : (N, 2)         — [qrs_duration_ms, qt_interval_ms]
+         (N, W)         — Pan-Tompkins decision signal (1:1 ms), W = WINDOW_PRE+WINDOW_POST
+Output : (N, 2, W)      — soft probability mask [QRS, QT] over the beat window
+                          sum over last dim ≈ duration in ms
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-import torch
-import torch.nn as nn
-class LearnedCompressor(nn.Module):
-    def __init__(self, embed_dim, k, L, t, width=256):
-        super().__init__()
-
-        time_stride = t // k
-        W = width
-
-        self.net = nn.Sequential(
-            # 1. reduce channel dimension (D → W)
-            nn.Conv2d(embed_dim, W, kernel_size=1),
-            nn.GELU(),
-            nn.BatchNorm2d(W),
-
-            # 2. channel mixing at full width (4 layers ~263K at W=256)
-            nn.Conv2d(W, W, kernel_size=1), nn.GELU(),
-            nn.Conv2d(W, W, kernel_size=1), nn.GELU(),
-            nn.Conv2d(W, W, kernel_size=1), nn.GELU(),
-            nn.Conv2d(W, W, kernel_size=1), nn.GELU(),
-
-            # 3. collapse leads (depthwise, cheap)
-            nn.Conv2d(W, W, kernel_size=(L, 1), groups=W),
-            nn.GELU(),
-
-            # 4. collapse time (depthwise, cheap)
-            nn.Conv2d(W, W, kernel_size=(1, time_stride),
-                      stride=(1, time_stride), groups=W),
-            nn.GELU(),
-
-            # 5. output projection W → 64
-            nn.Conv2d(W, 64, kernel_size=1),
-            nn.GELU(),
-        )
-
+class _Positive(nn.Module):
+    """Parametrization that constrains a weight tensor to be strictly positive via softplus."""
     def forward(self, x):
-        return self.net(x)
+        return F.softplus(x)
 
-class ConvHead(nn.Module):
-    def __init__(self, embed_dim, embed_L, embed_t,
-                 decision_size=530, hidden=256, dropout=0.1, k=1):
+
+class MaskHead(nn.Module):
+    """Compressor + fusion head: HuBERT embeddings + PT signal → (2, 550) mask.
+
+    Architecture
+    ------------
+    g path  — COMPRESSOR
+      (N, 12, t, D) permute→ (N, D, 12, t)
+      Conv2d bottleneck + depthwise lead-collapse → (N, 1, 1, t)
+      squeeze + upsample → (N, 1, window_size)   coarse prior g
+
+    f path  — POINTWISE MLP on PT decision signal
+      (N, window_size) → (N, 1, window_size)     refined prior f
+
+    FUSION
+      cat[sigmoid(f), sigmoid(g)] → (N, 2, window_size)
+      Conv1d × 3 → (N, 2, window_size) logits   (2 channels: QRS, QT)
+      sigmoid → mask
+    """
+
+    def __init__(self, embed_dim=768, window_size=None, width=128):
+        # width is accepted for API compatibility but unused
         super().__init__()
+        if window_size is None:
+            from beat import WINDOW_PRE, WINDOW_POST
+            window_size = WINDOW_PRE + WINDOW_POST
+        self.window_size = window_size
 
-        self.k = k
-        self.L=embed_L
-        self.t=embed_t
+        self.compress = nn.Sequential(
+            nn.Conv2d(embed_dim, 1024, kernel_size=1),
+            nn.BatchNorm2d(1024),
+            nn.GELU(),                                                            # (N, 1024, 12, t)
 
-        # -------------------------
-        # Learned compression
-        # -------------------------
-        self.conv = LearnedCompressor(embed_dim, k, embed_L, embed_t)
+            nn.Conv2d(1024, 512, kernel_size=1), nn.GELU(),                        # (N, 512, 12, t)
+            
+            nn.Conv2d(512, 128, kernel_size=(1, 7), padding=(0, 3), groups=128), nn.GELU(),  # (N, 128, 12, t)
+            nn.Conv2d(128, 64,  kernel_size=(1, 7), padding=(0, 3), groups=64),  nn.GELU(),  # (N, 64,  12, t)
+            nn.Conv2d(64,  32,  kernel_size=(1, 7), padding=(0, 3), groups=32),  nn.GELU(),  # (N, 32,  12, t)
+            nn.Conv2d(32,  16,  kernel_size=(1, 7), padding=(0, 3), groups=16),  nn.GELU(),  # (N, 16,  12, t)
 
-        # -------------------------
-        # Decision encoder  (530→512→256→256→64, ~485K)
-        # -------------------------
-        self.decision_enc = nn.Sequential(
-            nn.Linear(decision_size, 512),
-            nn.GELU(),
-            nn.Linear(512, 256),
-            nn.GELU(),
-            nn.Linear(256, 256),
-            nn.GELU(),
-            nn.Linear(256, 64),
-            nn.GELU(),
+            # learned lead collapse at the end
+            nn.Conv2d(16,   1,  kernel_size=(12, 7), padding=(0, 3)),                         # (N,  1,  1, t)
         )
-        feat_dim = 64 * k + 64
+        # ── f path: pointwise MLP on PT signal ───────────────────────
+        self.pt_mlp = nn.Sequential(
+            nn.Conv1d(1, 128, kernel_size=1), nn.GELU(),
 
-        # -------------------------
-        # QRS head
-        # -------------------------
-        self.qrs_head = nn.Sequential(
-            nn.Linear(feat_dim, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 1),
+            nn.Conv1d(128, 1, kernel_size=1),                # (N, 1, 550)
         )
 
-        # -------------------------
-        # QT head (QRS conditioned)
-        # -------------------------
-        self.qt_head = nn.Sequential(
-            nn.Linear(feat_dim + 1, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 1),
+        # ── fusion ────────────────────────────────────────────────────
+        self.fusion = nn.Sequential(
+            nn.Conv1d(2, 64, kernel_size=7, padding=3), nn.GELU(),
+            nn.Conv1d(64, 64, kernel_size=7, padding=3), nn.GELU(),
+            nn.Conv1d(64, 1, kernel_size=1),                 # (N, 1, 550) logits — QRS only
         )
-
-        # controls
-        self.qt_enabled = True
-        self.detach_qrs_for_qt = False
 
         # ablation flags
-        self.ablate_embedding = False   # zero out the HuBERT embedding branch
-        self.ablate_decision  = False   # zero out the decision signal branch
+        self.ablate_embedding = False
+        self.ablate_decision  = False
 
-    # -------------------------
-    # Controls
-    # -------------------------
-    def enable_qt(self, flag=True):
-        self.qt_enabled = flag
+    def _forward_impl(self, x, decision):
+        # x: (N, L, t, D) — e.g. (N, 12, 96, 768)
+        N, L, t, D = x.shape
 
-    def freeze_qrs(self):
-        for p in self.conv.parameters():
-            p.requires_grad = False
-        for p in self.decision_enc.parameters():
-            p.requires_grad = False
-        for p in self.qrs_head.parameters():
-            p.requires_grad = False
+        # ── g: compressor ─────────────────────────────────────────────
+        g = x.permute(0, 3, 1, 2)          # (N, D, L, t) = (N, 768, 12, 96)
+        if self.ablate_embedding:
+            g = torch.zeros_like(g)
+        g = self.compress(g)                # (N, 1, 1, t)
+        g = g.squeeze(2)                    # (N, 1, t)
+        g = F.interpolate(g, size=self.window_size,
+        mode='linear', align_corners=False)  # (N, 1, 550)
 
-    def freeze_qt(self):
-        for p in self.qt_head.parameters():
-            p.requires_grad = False
 
-    def unfreeze_all(self):
-        for p in self.parameters():
-            p.requires_grad = True
 
-    def set_detach_qrs(self, flag=True):
-        self.detach_qrs_for_qt = flag
+
+
+        # ── f: PT signal ──────────────────────────────────────────────
+        d = decision.unsqueeze(1)           # (N, 1, 550)
+        if self.ablate_decision:
+            d = torch.zeros_like(d)
+        
+        f = d#self.pt_mlp(d)                  # (N, 1, 550)
+        mu  = d.mean(dim=-1, keepdim=True)
+        std = d.std(dim=-1, keepdim=True).clamp(min=1e-6)
+        f = (d - mu) / std   
+        
+        mu  = g.mean(dim=-1, keepdim=True)
+        std = g.std(dim=-1, keepdim=True).clamp(min=1e-6)
+        g = (g ) / std   
+        
+
+        logits =self.fusion(torch.cat([g, f], dim=1))  # (N, 1, 550)
+        mask   = torch.sigmoid(logits)
+
+        return logits, mask, mask.sum(dim=-1), f, g
+
+    def forward(self, x, decision):
+        logits, mask, durations, _, _ = self._forward_impl(x, decision)
+        return logits, mask, durations
+
+    def forward_debug(self, x, decision):
+        """Like forward but also returns f_sig and g_sig (pre-fusion branch outputs)."""
+        return self._forward_impl(x, decision)
 
     def set_ablation(self, embedding=False, decision=False):
         self.ablate_embedding = embedding
         self.ablate_decision  = decision
 
-    # -------------------------
-    # Forward
-    # -------------------------
-    def forward(self, x, decision):
-        # x: (N, L, t, D) → (N, D, L, t)
-        x = x.permute(0, 3, 1, 2)
 
-        # ---- Compression ----
-        if self.ablate_embedding:
-            x = torch.zeros_like(x)
-        x = self.conv(x).flatten(1)                # (N, 64*k)
-
-        # ---- Decision branch ----
-        decision_feat = self.decision_enc(decision) # (N, 64)
-        if self.ablate_decision:
-            decision_feat = torch.zeros_like(decision_feat)
-
-        feat = torch.cat([x, decision_feat], dim=1)
-
-        # ---- QRS ----
-        qrs = self.qrs_head(feat)
-
-        # ---- QT ----
-        if self.qt_enabled:
-            qrs_for_qt = qrs.detach() if self.detach_qrs_for_qt else qrs
-            qt_input = torch.cat([feat, qrs_for_qt], dim=1)
-            qt = self.qt_head(qt_input)
-        else:
-            qt = torch.zeros_like(qrs)
-
-        return torch.cat([qrs, qt], dim=1)
-        
 class HuBERTECGRegressor(nn.Module):
     def __init__(
         self,
         repo_id='Edoardo-BS/hubert-ecg-base',
-        hidden=256,
-        dropout=0.1,
+        width=128,
         freeze=True,
     ):
         super().__init__()
         from transformers import AutoModel
+        from beat import WINDOW_PRE, WINDOW_POST
 
         self.encoder = AutoModel.from_pretrained(
             repo_id, trust_remote_code=True
@@ -187,26 +144,19 @@ class HuBERTECGRegressor(nn.Module):
 
         embed_dim = self.encoder.config.hidden_size
 
-        # ---- infer t via dummy forward ----
+        # infer t via dummy forward
         with torch.no_grad():
             dummy = torch.zeros(1, 12, 2500)
             N, L, T = dummy.shape
-
             dummy_flat = dummy.reshape(N * L, T)
             out = self.encoder(input_values=dummy_flat).last_hidden_state
+            self.t = out.shape[1]
+            self.L = L  # 12
 
-            self.t = out.shape[1]   # store it
-            self.L = L              # = 12
-
-        from beat import WINDOW_PRE, WINDOW_POST
-
-        self.head = ConvHead(
-            embed_dim,
-            L,
-            self.t,
-            decision_size=WINDOW_PRE + WINDOW_POST,
-            hidden=hidden,
-            dropout=dropout,
+        self.head = MaskHead(
+            embed_dim=embed_dim,
+            window_size=WINDOW_PRE + WINDOW_POST,
+            width=width,
         )
 
         if freeze:
@@ -215,17 +165,59 @@ class HuBERTECGRegressor(nn.Module):
 
     def encode(self, x):
         N, L, T = x.shape
-
         x_flat = x.reshape(N * L, T)
         out = self.encoder(input_values=x_flat).last_hidden_state  # (N*L, t, D)
-
         t, D = out.shape[1], out.shape[2]
-       # print(out.shape, flush=True)
         return out.reshape(N, L, t, D)
 
     def forward(self, x, decision):
         feats = self.encode(x)              # (N, 12, t, D)
-        return self.head(feats, decision)
+        return self.head(feats, decision)   # (mask, durations)
+
+
+class PTHead(nn.Module):
+    """Minimal Pan-Tompkins baseline head.
+
+    No embeddings used — output is purely sigmoid(decision_signal).
+    Matches the MaskHead interface exactly so it drops into the same
+    training/eval loop without any changes.
+    """
+
+    def __init__(self, window_size=None, **kwargs):
+        super().__init__()
+        if window_size is None:
+            from beat import WINDOW_PRE, WINDOW_POST
+            window_size = WINDOW_PRE + WINDOW_POST
+        self.window_size = window_size
+                # ── f path: pointwise MLP on PT signal ───────────────────────
+        self.scale=nn.Linear(window_size, window_size)
+        nn.utils.parametrize.register_parametrization(self.scale, 'weight', _Positive())
+        nn.utils.parametrize.register_parametrization(self.scale, 'bias',   _Positive())
+
+    def _forward_impl(self, x, decision):
+        # x (embeddings) intentionally ignored
+        d      = decision.unsqueeze(1)          # (N, 1, W)
+        mu  = d.mean(dim=-1, keepdim=True)
+        std = d.std(dim=-1, keepdim=True).clamp(min=1e-6)
+        f_sig = (d - mu) / std   
+        f=self.scale(f_sig)
+        mask   = torch.sigmoid(f)
+        durations = mask.sum(dim=-1)                        # (N, 1)
+
+        # for debug plot
+        w = self.scale.weight
+        g_sig  = (w.unsqueeze(0)) / (w.std(dim=-1, keepdim=True).clamp(min=1e-6))  # (1, W)
+
+
+        return f, mask, durations, f_sig, g_sig
+
+    def forward(self, x, decision):
+        logits, mask, durations, _, _ = self._forward_impl(x, decision)
+        return logits, mask, durations
+
+    def forward_debug(self, x, decision):
+        return self._forward_impl(x, decision)
+
 
 def build_model(device=None, **kwargs):
     if device is None:
@@ -235,130 +227,36 @@ def build_model(device=None, **kwargs):
 
 
 if __name__ == '__main__':
-    import numpy as np
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import matplotlib.gridspec as gridspec
-    from beat import process_study
-    from dataset import BeatDataset, preprocess_hubert
-
-    LEAD_NAMES  = ['I','II','III','aVR','aVL','aVF','V1','V2','V3','V4','V5','V6']
-    DEMO_LEAD   = 1   # Lead II — shown in the channel time-series panel
-    N_CHANNELS  = 8   # number of embedding dims to trace
+    from beat import process_study, WINDOW_PRE, WINDOW_POST
+    from dataset import BeatDataset, preprocess_hubert, build_mask
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     beats, _, _ = process_study('data/p21/ecg_data.txt')
-    ds      = BeatDataset(beats, transform=preprocess_hubert)
-    x, d, y = ds[0]
-    x = x.unsqueeze(0).to(device)   # (1, 12, 2500)
-    d = d.unsqueeze(0).to(device)   # (1, 530)
+    ds = BeatDataset(beats, transform=preprocess_hubert)
+    x, d, y_mask = ds[0]
 
-    model, _ = build_model(device=device)
+    x      = x.unsqueeze(0).to(device)       # (1, 12, 2500)
+    d      = d.unsqueeze(0).to(device)       # (1, 550)
+    y_mask = y_mask.unsqueeze(0).to(device)  # (1, 2, 550)
+
+    model, _ = build_model(device=device, freeze=True, width=256)
+    n_params   = sum(p.numel() for p in model.parameters())
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'Total params     : {n_params:,}')
+    print(f'Trainable params : {n_trainable:,}')
+
     model.eval()
     with torch.no_grad():
-        enc  = model.encode(x).squeeze(0).cpu().numpy()   # (12, t, D)
-        pred = model(x, d).cpu()
+        logits, mask, durations = model(x, d)   # (1,2,550), (1,2,550), (1,2)
 
-    L, t, D = enc.shape
-    print(f'Encoding : {enc.shape}  (leads × frames × dim)')
-    print(f'Pred     : qrs={pred[0,0]:.1f} ms   qt={pred[0,1]:.1f} ms')
-    print(f'Target   : qrs={y[0]:.1f} ms       qt={y[1]:.1f} ms')
+    beat = ds.beats[0]
+    true_dur = y_mask[0].sum(dim=-1)    # (2,)
 
-    # ---- derived quantities -----------------------------------------
-    per_lead_avg = enc.mean(axis=1)                          # (12, D)  time-averaged
-
-    # lead-to-lead cosine similarity
-    norms    = np.linalg.norm(per_lead_avg, axis=1, keepdims=True)
-    normed   = per_lead_avg / (norms + 1e-8)
-    cos_mat  = normed @ normed.T                             # (12, 12)
-
-    # evenly-spaced embedding channels for the time-series panel
-    ch_idx   = np.linspace(0, D - 1, N_CHANNELS, dtype=int)
-    lead_seq = enc[DEMO_LEAD]                                # (t, D)
-    ms_axis  = np.linspace(0, 5000, t)                      # approx ms (5 s window)
-
-    # ---- Lead II — swap: 768 as "time", 38 frames as "channels" ----
-    lead_II  = enc[DEMO_LEAD].T                           # (D, t) = (768, 38)
-    dim_axis = np.arange(D)                               # x-axis: 0..767
-
-    # dim-to-dim cosine similarity: each dim has a 38-frame vector
-    norms_f    = np.linalg.norm(lead_II, axis=1, keepdims=True)  # (D, 1)
-    normed_f   = lead_II / (norms_f + 1e-8)                      # (D, t)
-    cos_frames = normed_f @ normed_f.T                            # kept for compat (D, D) — also used below
-
-    # L2 norm per dim-position (over the 38 channels)
-    dim_norms = np.linalg.norm(lead_II, axis=1)           # (D,)
-
-    # a few evenly-spaced channels (original frames) to trace over 768 dims
-    N_CH     = 8
-    ch_pick  = np.linspace(0, t - 1, N_CH, dtype=int)
-
-    # ---- layout -----------------------------------------------------
-    fig = plt.figure(figsize=(17, 11))
-    gs  = gridspec.GridSpec(
-        3, 2,
-        height_ratios=[1.4, 1.0, 1.2],
-        hspace=0.55, wspace=0.35,
-    )
-
-    # 1. Heatmap  (38 frames × 768 dims) — channels on Y, dims on X
-    ax0  = fig.add_subplot(gs[0, 0])
-    vmax = np.percentile(np.abs(lead_II), 98)
-    im0  = ax0.imshow(lead_II.T, aspect='auto', cmap='RdBu_r',
-                      vmin=-vmax, vmax=vmax, interpolation='nearest')
-    ax0.set_xlabel('Embedding dimension', fontsize=8)
-    ax0.set_ylabel('Frame (channel)', fontsize=8)
-    ax0.set_title(f'{LEAD_NAMES[DEMO_LEAD]} embedding  ({t} frames × {D} dims)', fontsize=9)
-    fig.colorbar(im0, ax=ax0, shrink=0.85, pad=0.02)
-
-    # 2. Dim-to-dim cosine similarity  (768 × 768)
-    cos_dims = normed_f @ normed_f.T                      # (D, D)
-    ax1 = fig.add_subplot(gs[0, 1])
-    im1 = ax1.imshow(cos_dims, aspect='equal', cmap='coolwarm',
-                     vmin=-1, vmax=1, interpolation='nearest')
-    ax1.set_xlabel('Embedding dimension', fontsize=8)
-    ax1.set_ylabel('Embedding dimension', fontsize=8)
-    ax1.set_title('Dim-to-dim cosine similarity\n(using 38-frame vectors)', fontsize=9)
-    fig.colorbar(im1, ax=ax1, shrink=0.85, pad=0.02)
-
-    # 3. L2 norm over 768 dim-positions
-    ax2 = fig.add_subplot(gs[1, :])
-    ax2.plot(dim_axis, dim_norms, color='steelblue', linewidth=1.2)
-    ax2.fill_between(dim_axis, dim_norms, alpha=0.2, color='steelblue')
-    ax2.set_xlabel('Embedding dimension', fontsize=8)
-    ax2.set_ylabel('||emb||', fontsize=8)
-    ax2.set_title(f'{LEAD_NAMES[DEMO_LEAD]} — L2 norm across 38 frames, per dim', fontsize=9)
-    ax2.grid(alpha=0.25)
-
-    # 4. Selected frames (channels) traced over 768 dims
-    ax3    = fig.add_subplot(gs[2, :])
-    colors = plt.cm.tab10(np.linspace(0, 1, N_CH))
-    for fi, color in zip(ch_pick, colors):
-        ax3.plot(dim_axis, lead_II[:, fi], color=color,
-                 linewidth=1.2, label=f'frame {fi} (~{ms_axis[fi]:.0f}ms)')
-    ax3.set_xlabel('Embedding dimension', fontsize=8)
-    ax3.set_ylabel('Activation', fontsize=8)
-    ax3.set_title(
-        f'{LEAD_NAMES[DEMO_LEAD]} — {N_CH} evenly-spaced frames over 768 dims',
-        fontsize=9,
-    )
-    ax3.legend(ncol=N_CH, fontsize=8, loc='upper right', framealpha=0.7)
-    ax3.axhline(0, color='k', linewidth=0.6, linestyle='--', alpha=0.4)
-    ax3.grid(alpha=0.25)
-
-    fig.suptitle(
-        f'HuBERT-ECG encoding  |  spike={beats[0].spike_idx} ms  '
-        f'QRS={y[0]:.0f} ms  QT={y[1]:.0f} ms',
-        fontsize=11,
-    )
-    plt.savefig('embedding_viz.png', dpi=150, bbox_inches='tight')
-    print('Saved embedding_viz.png')
-    model, _ = build_model(device=device)
-
-    n_params = sum(p.numel() for p in model.parameters())
-    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    print(f'Total parameters: {n_params:,}')
-    print(f'Trainable parameters: {n_trainable:,}')
+    print(f'\nBeat  spike={beat.spike_idx} ms')
+    print(f'QRS   pred={durations[0,0]:.1f} ms   true={true_dur[0]:.0f} ms   err={durations[0,0]-true_dur[0]:+.1f} ms')
+    print(f'QT    pred={durations[0]:.1f} ms   true={true_dur[1]:.0f} ms   err={durations[0,1]-true_dur[1]:+.1f} ms')
+    print(f'\nLogits shape    : {tuple(logits.shape)}')
+    print(f'Mask shape      : {tuple(mask.shape)}')
+    print(f'Durations shape : {tuple(durations.shape)}')
+    print(f'Mask range      : [{mask.min():.3f}, {mask.max():.3f}]')

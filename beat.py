@@ -4,8 +4,8 @@ from scipy.signal import butter, filtfilt, find_peaks
 from scipy.ndimage import uniform_filter1d
 
 FS           = 1000   # Hz  (1 sample == 1 ms)
-WINDOW_PRE   = 50     # samples before spike
-WINDOW_POST  = 500    # samples after spike  (QRS + ST + T-wave)
+WINDOW_PRE   = 150     # samples before spike
+WINDOW_POST  = 400    # samples after spike  (QRS + ST + T-wave)
 
 CONTEXT_PRE  = 2500   # samples before spike for encoder context (2.5 s at 1 kHz)
 CONTEXT_POST = 2500   # samples after  spike for encoder context (2.5 s at 1 kHz)
@@ -39,6 +39,7 @@ class Beat:
         self.qt_interval  = None
         self.qt_start     = None               # absolute ms position of QT onset
         self.noisy        = False              # True if window overlaps another beat
+        self.source       = None               # filepath this beat was extracted from
 
         self.context_window   = None          # (n_leads, CONTEXT_PRE+CONTEXT_POST) — 5 s centred on spike
         self.spike_in_context = CONTEXT_PRE   # sample index of spike inside context_window (at FS)
@@ -269,7 +270,7 @@ def leads_matrix(leads):
 def _pan_tompkins_core(
     sig,
     fs,
-    min_distance_ms=200,
+    min_distance_ms=150,
     band=(5, 40),
     integration_window=150,
     percentile=80,
@@ -316,7 +317,7 @@ def _pan_tompkins_core(
         peaks, _ = find_peaks(
             integrated,
             height=thr2,
-            distance=200,
+            distance=min_distance_ms,
             prominence=0.6 * np.max(integrated)
         )
     else:
@@ -365,7 +366,8 @@ def pan_tompkins_signal(leads):
 # =========================================================
 
 def extract_windows(signal_matrix, spike_indices):
-    """Slice a symmetric window around each spike across all leads.
+    """Slice an asymmetric window around each spike across all leads.
+    Window spans [spike - WINDOW_PRE, spike + WINDOW_POST).
 
     Parameters
     ----------
@@ -392,7 +394,7 @@ def extract_windows(signal_matrix, spike_indices):
 # 5. ANNOTATION  —  match spikes to marked beats
 # =========================================================
 
-def annotate_beats(beats, annotations, tol_ms=100.0):
+def annotate_beats(beats, annotations, tol_ms=150.0):
     """Attach QRS / QT / label to each beat using embedded annotations.
 
     Matching strategy
@@ -416,31 +418,43 @@ def annotate_beats(beats, annotations, tol_ms=100.0):
     arr_wins = [(r[0], r[1]) for r in arr_rows if len(r) >= 4]
     ext_wins = [(r[0], r[1]) for r in ext_rows if len(r) >= 4]
 
+    # ── label assignment (per-beat, no conflict possible) ────────────
     for beat in beats:
         t = beat.spike_time
-
         if any(t_s <= t <= t_e for t_s, t_e in arr_wins):
-            label = 1
+            beat.annotate(label=1)
         elif any(t_s <= t <= t_e for t_s, t_e in ext_wins):
-            label = 2
+            beat.annotate(label=2)
         else:
-            label = 0
-        beat.annotate(label=label)
+            beat.annotate(label=0)
 
-        if len(qrs_data):
-            for row in qrs_data:
-                if row[0] - tol_ms <= t <= row[1] + tol_ms:
-                    beat.annotate(period=float(row[2]),
-                                  qrs_duration=float(row[3]),
-                                  qrs_start=float(row[0]))
-                    break
+    # ── QRS / QT: global one-to-one assignment ────────────────────────
+    # Each annotation row goes to the single closest spike; each spike
+    # gets at most one annotation.  Ties broken by distance to interval.
+    def _assign(data, apply_fn):
+        if not len(data):
+            return
+        candidates = []
+        for bi, beat in enumerate(beats):
+            t = beat.spike_time
+            for ri, row in enumerate(data):
+                start, end = row[0], row[1]
+                if start - tol_ms <= t <= end + tol_ms:
+                    dist = max(0.0, start - t, t - end)  # 0 if spike inside interval
+                    candidates.append((dist, bi, ri))
+        candidates.sort()
+        used_beats, used_rows = set(), set()
+        for dist, bi, ri in candidates:
+            if bi in used_beats or ri in used_rows:
+                continue
+            apply_fn(beats[bi], data[ri])
+            used_beats.add(bi)
+            used_rows.add(ri)
 
-        if len(qt_data):
-            for row in qt_data:
-                if row[0] - tol_ms <= t <= row[1] + tol_ms:
-                    beat.annotate(qt_interval=float(row[3]),
-                                  qt_start=float(row[0]))
-                    break
+    _assign(qrs_data, lambda b, row: b.annotate(
+        period=float(row[2]), qrs_duration=float(row[3]), qrs_start=float(row[0])))
+    _assign(qt_data,  lambda b, row: b.annotate(
+        qt_interval=float(row[3]), qt_start=float(row[0])))
 
     return beats
 
@@ -487,10 +501,10 @@ def process_study(filepath):
     spikes             = detect_spikes(leads)
     beats              = extract_windows(matrix, spikes)
     annotate_beats(beats, annotations)
-    mark_noisy_beats(beats)
-    recover_noisy_beats(beats, matrix)
     extract_context_windows(matrix, beats)
     extract_decision_windows(leads, beats)
+    for beat in beats:
+        beat.source = filepath
     return beats, lead_names, leads
 
 
@@ -611,7 +625,7 @@ if __name__ == "__main__":
     # ----------------------------------------------------------
     _sep("C. load_patient_beats")
 
-    folders = sorted(_glob.glob(os.path.join(DATA_DIR, "p*")))
+    folders = sorted(_glob.glob(os.path.join(DATA_DIR, "p7*")))
     print(f"Patient folders found: {folders}")
 
     annotated, unannotated, noisy = load_patient_beats(folders)
@@ -660,7 +674,7 @@ if __name__ == "__main__":
 
     sig_i = leads['I']
     decision, thr = pan_tompkins_signal(leads)
-    plot_signal_windows(sig_i, _beats_plot, t_start=50000, t_end=70_000,
+    plot_signal_windows(sig_i, _beats_plot, t_start=276229-1000, t_end=276229+1000,
                         decision=decision, threshold=thr)
     plt.savefig("signal_windows.png", dpi=300, bbox_inches="tight")
     print("Saved signal_windows.png")
@@ -681,5 +695,116 @@ if __name__ == "__main__":
         plot_annotated_beat(ann_beats[0], lead_names)
         plt.savefig("annotated_beat.png", dpi=300, bbox_inches="tight")
         print("Saved annotated_beat.png")
+
+    # ----------------------------------------------------------
+    # G. Mask-vs-annotation audit
+    # ----------------------------------------------------------
+    _sep("G. Mask-vs-annotation audit")
+
+    from dataset import build_mask, WINDOW_SIZE as _WS
+
+    TOL = 1.0   # ms tolerance for rounding
+
+    zero_qrs, zero_qt, mismatch_qrs, mismatch_qt = [], [], [], []
+    for b in annotated:
+        m        = build_mask(b)
+        qrs_sum  = float(m[0].sum())
+        qt_sum   = float(m[1].sum())
+        qrs_err  = abs(qrs_sum - b.qrs_duration)
+        qt_err   = abs(qt_sum  - b.qt_interval)
+
+        ws     = b.spike_idx - b.window_pre
+        qrs_lo = int(round(b.qrs_start)) - ws
+        qrs_hi = qrs_lo + int(round(b.qrs_duration))
+        qt_lo  = int(round(b.qt_start))  - ws
+        qt_hi  = qt_lo  + int(round(b.qt_interval))
+
+        flags = []
+        if qrs_sum == 0:
+            flags.append('QRS=ZERO')
+            zero_qrs.append(b)
+        elif qrs_err > TOL:
+            flags.append(f'QRS_MISMATCH({qrs_sum:.0f}vs{b.qrs_duration:.1f})')
+            mismatch_qrs.append(b)
+       # if qt_sum == 0:
+      #      flags.append('QT=ZERO')
+       #     zero_qt.append(b)
+     #   elif qt_err > TOL:
+        #    flags.append(f'QT_MISMATCH({qt_sum:.0f}vs{b.qt_interval:.1f})')
+        #    mismatch_qt.append(b)
+
+        if flags:
+            clip_sides = []
+            if qrs_lo < 0:              clip_sides.append('QRS:start')
+            if qrs_hi > _WS:            clip_sides.append('QRS:end')
+            if qt_lo  < 0:              clip_sides.append('QT:start')
+            if qt_hi  > _WS:            clip_sides.append('QT:end')
+            src = os.path.basename(os.path.dirname(b.source)) if b.source else '?'
+            print(
+                f"  [{src}] spike={b.spike_idx:6d}  win=[{ws},{ws+_WS})  "
+                f"qrs=[{qrs_lo},{qrs_hi}) → {qrs_sum:.0f}/{b.qrs_duration:.1f}ms  "
+                f"qt=[{qt_lo},{qt_hi}) → {qt_sum:.0f}/{b.qt_interval:.1f}ms  "
+                f"clip={','.join(clip_sides) or 'rounding'}  !! {' | '.join(flags)}"
+            )
+
+    clip_qrs_start = sum(1 for b in annotated
+                         if (int(round(b.qrs_start)) - (b.spike_idx - b.window_pre)) < 0)
+    clip_qrs_end   = sum(1 for b in annotated
+                         if (int(round(b.qrs_start)) - (b.spike_idx - b.window_pre)
+                             + int(round(b.qrs_duration))) > _WS)
+    clip_qt_start  = sum(1 for b in annotated
+                         if (int(round(b.qt_start))  - (b.spike_idx - b.window_pre)) < 0)
+    clip_qt_end    = sum(1 for b in annotated
+                         if (int(round(b.qt_start))  - (b.spike_idx - b.window_pre)
+                             + int(round(b.qt_interval))) > _WS)
+
+    print(f"\nSummary: {len(annotated)} annotated beats")
+    print(f"  zero QRS mask      : {len(zero_qrs)}")
+    print(f"  zero QT  mask      : {len(zero_qt)}")
+    print(f"  QRS sum != annot   : {len(mismatch_qrs)}  (clips at start={clip_qrs_start}, end={clip_qrs_end})")
+    print(f"  QT  sum != annot   : {len(mismatch_qt)}  (clips at start={clip_qt_start}, end={clip_qt_end})")
+    if not any([zero_qrs, zero_qt, mismatch_qrs, mismatch_qt]):
+        print("  all masks match annotations exactly")
+
+    # ----------------------------------------------------------
+    # H. Duplicate spike + wrong-annotation audit
+    # ----------------------------------------------------------
+    _sep("H. Duplicate spike + wrong-annotation audit")
+
+    from collections import Counter
+    # Group by source file — spike_idx is file-local so duplicates only meaningful within a file
+    from itertools import groupby
+    beats_by_source = {}
+    for b in annotated:
+        beats_by_source.setdefault(b.source, []).append(b)
+
+    total_spike_dups = 0
+    total_annot_dups = 0
+
+    for src, src_beats in sorted(beats_by_source.items()):
+        src_label = os.path.basename(os.path.dirname(src))
+
+        # duplicate spike_idx within same study
+        spike_counts = Counter(b.spike_idx for b in src_beats)
+        for spike, count in sorted(spike_counts.items()):
+            if count > 1:
+                total_spike_dups += 1
+                print(f"  [{src_label}] DUPLICATE SPIKE spike={spike}  (x{count})")
+
+        # same qrs_start claimed by more than one beat
+        qrs_counts = Counter(b.qrs_start for b in src_beats)
+        for qrs_start, count in sorted(qrs_counts.items()):
+            if count > 1:
+                total_annot_dups += 1
+                spikes = ', '.join(str(b.spike_idx)
+                                   for b in src_beats if b.qrs_start == qrs_start)
+                print(f"  [{src_label}] SHARED ANNOTATION qrs_start={qrs_start:.0f}  "
+                      f"claimed by spikes [{spikes}]  (x{count})")
+
+    if total_spike_dups == 0 and total_annot_dups == 0:
+        print("No duplicate spikes or shared annotations found.")
+
+    print(f"\nSummary: {total_spike_dups} duplicate spike(s), "
+          f"{total_annot_dups} shared annotation(s)")
 
       
