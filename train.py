@@ -7,6 +7,8 @@ Output masks: (N, 2, W) float in [0, 1]  where W = WINDOW_PRE + WINDOW_POST.
   mask[:, 0, :].sum(-1) ≈ QRS duration in ms
   mask[:, 1, :].sum(-1) ≈ QT  interval in ms
 
+For the PT-signal baseline head, use train_pt.py instead.
+
 NOTE: embedding caches (cache/*_ys.npy) from the previous scalar-head run
 are incompatible — run with --force once to rebuild them.
 """
@@ -24,7 +26,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from tqdm import tqdm
 
-from beat import load_patient_beats, load_or_process_beats
+from beat import load_or_process_beats
 from dataset import BeatDataset, preprocess_hubert
 from model import build_model
 
@@ -84,23 +86,6 @@ def precompute_embeddings(model, dataset, batch_size, device, desc=''):
     )  # (N, 550)
 
     return torch.cat(embs), torch.cat(decisions), torch.cat(ys), lead2
-
-
-@torch.no_grad()
-def precompute_decisions(dataset, batch_size, desc=''):
-    """Collect decision windows + ys without running the encoder (PT baseline)."""
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
-                        num_workers=4, pin_memory=True)
-    decisions, ys = [], []
-    for _, d, y in tqdm(loader, desc=desc, leave=False):
-        decisions.append(d)
-        ys.append(y)
-    lead2 = torch.from_numpy(
-        np.stack([b.window[2, :].astype(np.float32) for b in dataset.beats])
-    )
-    dec = torch.cat(decisions)
-    dummy_embs = torch.zeros(len(dec), 1, 1, 1)   # PTHead ignores embs
-    return dummy_embs, dec, torch.cat(ys), lead2
 
 
 class _ModelWithHead:
@@ -345,44 +330,21 @@ def main(args):
     # ----------------------------------------------------------
     # Model + precompute embeddings
     # ----------------------------------------------------------
-    if args.model == 'pt':
-        print('Building PT baseline head...')
-        from model import PTHead
-        model = _ModelWithHead(PTHead())
-        model.head.to(device)
+    print('Building model (or loading head from cache)...')
+    model = load_or_build_model(
+        args.cache_dir, args.force, device, args.width,
+        train_folders, holdout_folders,
+    )
 
-        print('Collecting decision windows (no encoder needed)...')
-        if need_beats:
-            embs,    decisions, ys,     _lead2   = precompute_decisions(train_ds_full, args.batch_size, '  train  ')
-            ho_embs, ho_decisions, ho_ys, ho_lead2 = precompute_decisions(holdout_ds,   args.batch_size, '  holdout')
-        else:
-            # load decisions+ys from cache; embs unused so use dummies
-            decisions  = torch.from_numpy(np.load(f'{train_cp}_decisions.npy'))
-            ys         = torch.from_numpy(np.load(f'{train_cp}_ys.npy'))
-            embs       = torch.zeros(len(decisions), 1, 1, 1)
-            lead2_path = f'{train_cp}_lead2.npy'
-            _lead2     = torch.from_numpy(np.load(lead2_path)) if os.path.exists(lead2_path) else None
-            ho_decisions = torch.from_numpy(np.load(f'{holdout_cp}_decisions.npy'))
-            ho_ys        = torch.from_numpy(np.load(f'{holdout_cp}_ys.npy'))
-            ho_embs      = torch.zeros(len(ho_decisions), 1, 1, 1)
-            ho_lead2_path = f'{holdout_cp}_lead2.npy'
-            ho_lead2      = torch.from_numpy(np.load(ho_lead2_path)) if os.path.exists(ho_lead2_path) else None
-    else:
-        print('Building model (or loading head from cache)...')
-        model = load_or_build_model(
-            args.cache_dir, args.force, device, args.width,
-            train_folders, holdout_folders,
-        )
-
-        print('Precomputing embeddings (or loading from cache)...')
-        embs, decisions, ys, _lead2 = load_or_precompute(
-            model, train_ds_full, args.batch_size, device,
-            cache_path=train_cp, force=args.force, desc='  train  ',
-        )
-        ho_embs, ho_decisions, ho_ys, ho_lead2 = load_or_precompute(
-            model, holdout_ds, args.batch_size, device,
-            cache_path=holdout_cp, force=args.force, desc='  holdout',
-        )
+    print('Precomputing embeddings (or loading from cache)...')
+    embs, decisions, ys, _lead2 = load_or_precompute(
+        model, train_ds_full, args.batch_size, device,
+        cache_path=train_cp, force=args.force, desc='  train  ',
+    )
+    ho_embs, ho_decisions, ho_ys, ho_lead2 = load_or_precompute(
+        model, holdout_ds, args.batch_size, device,
+        cache_path=holdout_cp, force=args.force, desc='  holdout',
+    )
     print(f'  train={tuple(embs.shape)}  holdout={tuple(ho_embs.shape)}')
     print(f'  mask shape: {tuple(ys.shape)}')
 
@@ -542,7 +504,5 @@ if __name__ == '__main__':
     parser.add_argument('--cache_dir',        default='cache')
     parser.add_argument('--force',            action='store_true',
                         help='recompute and overwrite all caches')
-    parser.add_argument('--model',            default='nn', choices=['nn', 'pt'],
-                        help='nn = full HuBERT+MaskHead  |  pt = PT-signal baseline')
     args = parser.parse_args()
     main(args)
