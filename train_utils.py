@@ -60,14 +60,38 @@ def emb_cache_path(cache_dir, folders, tag):
     return os.path.join(cache_dir, f'emb_{tag}_{key}')
 
 
+def _embs_exist(base):
+    """True if an embs file exists in either format (.pt preferred, .npy legacy)."""
+    return os.path.exists(f'{base}_embs.pt') or os.path.exists(f'{base}_embs.npy')
+
+
 def _emb_cache_exists(base):
-    """True if the full annotated embedding cache (embs + decisions + ys) exists."""
-    return all(os.path.exists(f'{base}_{s}.npy') for s in ('embs', 'decisions', 'ys'))
+    """True if the full annotated embedding cache exists."""
+    return (_embs_exist(base)
+            and os.path.exists(f'{base}_decisions.npy')
+            and os.path.exists(f'{base}_ys.npy'))
 
 
 def _unann_cache_exists(base):
-    """True if the unannotated embedding cache (embs + decisions, no ys) exists."""
-    return all(os.path.exists(f'{base}_{s}.npy') for s in ('embs', 'decisions'))
+    """True if the unannotated embedding cache exists."""
+    return _embs_exist(base) and os.path.exists(f'{base}_decisions.npy')
+
+
+def _load_embs(base):
+    """Load embs tensor. Prefers .pt; auto-migrates .npy → .pt on first access."""
+    pt_path  = f'{base}_embs.pt'
+    npy_path = f'{base}_embs.npy'
+    if os.path.exists(pt_path):
+        return torch.load(pt_path, weights_only=True)
+    print(f'  [cache] migrating {os.path.basename(npy_path)} → .pt (faster future loads)')
+    t = torch.from_numpy(np.load(npy_path))
+    torch.save(t, pt_path)
+    return t
+
+
+def _save_embs(base, tensor):
+    """Save embs tensor as .pt."""
+    torch.save(tensor, f'{base}_embs.pt')
 
 
 def _ys_valid(base):
@@ -166,8 +190,8 @@ def load_or_precompute(model, dataset, batch_size, device,
     if not force and _emb_cache_exists(cache_path):
         ys_raw = np.load(f'{cache_path}_ys.npy')
         if ys_raw.ndim == 3:
-            print(f'  [cache] loading {cache_path}_*.npy')
-            embs      = torch.from_numpy(np.load(f'{cache_path}_embs.npy', mmap_mode='r'))
+            print(f'  [cache] loading {cache_path}_*')
+            embs      = _load_embs(cache_path)
             decisions = torch.from_numpy(np.load(f'{cache_path}_decisions.npy'))
             lead2     = (torch.from_numpy(np.load(lead2_path))
                          if os.path.exists(lead2_path) else None)
@@ -175,7 +199,7 @@ def load_or_precompute(model, dataset, batch_size, device,
 
         # embs+decisions are fine; only ys are stale — rebuild without re-encoding
         print(f'  [cache] stale ys {ys_raw.shape} — rebuilding (no re-encoding)')
-        embs      = torch.from_numpy(np.load(f'{cache_path}_embs.npy'))
+        embs      = _load_embs(cache_path)
         decisions = torch.from_numpy(np.load(f'{cache_path}_decisions.npy'))
         ys = torch.stack([dataset[i][2] for i in range(len(dataset))])
         np.save(f'{cache_path}_ys.npy', ys.numpy())
@@ -186,11 +210,11 @@ def load_or_precompute(model, dataset, batch_size, device,
     embs, decisions, ys, lead2 = precompute_embeddings(
         model, dataset, batch_size, device, desc=desc)
     os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
-    np.save(f'{cache_path}_embs.npy',      embs.numpy())
+    _save_embs(cache_path, embs)
     np.save(f'{cache_path}_decisions.npy', decisions.numpy())
     np.save(f'{cache_path}_ys.npy',        ys.numpy())
     np.save(lead2_path,                    lead2.numpy())
-    print(f'  [cache] saved {cache_path}_*.npy')
+    print(f'  [cache] saved {cache_path}_*')
     return embs, decisions, ys, lead2
 
 
@@ -216,17 +240,17 @@ def load_or_precompute_unann(model, dataset, batch_size, device,
                              cache_path, force=False, desc=''):
     """Load unannotated embeddings from cache, or precompute and save."""
     if not force and _unann_cache_exists(cache_path):
-        print(f'  [cache] loading {cache_path}_embs/decisions.npy')
-        embs      = torch.from_numpy(np.load(f'{cache_path}_embs.npy'))
+        print(f'  [cache] loading {cache_path}_embs/decisions')
+        embs      = _load_embs(cache_path)
         decisions = torch.from_numpy(np.load(f'{cache_path}_decisions.npy'))
         return embs, decisions
 
     embs, decisions = precompute_embeddings_unann(
         model, dataset, batch_size, device, desc=desc)
     os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
-    np.save(f'{cache_path}_embs.npy',      embs.numpy())
+    _save_embs(cache_path, embs)
     np.save(f'{cache_path}_decisions.npy', decisions.numpy())
-    print(f'  [cache] saved {cache_path}_embs/decisions.npy')
+    print(f'  [cache] saved {cache_path}_embs.pt / decisions.npy')
     return embs, decisions
 
 
