@@ -536,6 +536,28 @@ def load_or_process_beats(folders, cache_dir='cache', force=False,
     return result
 
 
+def _process_folder(args):
+    """Worker: process one folder and return (annotated, unannotated, noisy) lists."""
+    folder, ecg_filename = args
+    filepath = os.path.join(folder, ecg_filename)
+    if not os.path.isfile(filepath):
+        return [], [], []
+    try:
+        beats, _, _ = process_study(filepath)
+    except Exception:
+        return [], [], []
+
+    annotated, unannotated, noisy = [], [], []
+    for beat in beats:
+        if beat.noisy:
+            noisy.append(beat)
+        elif beat.qrs_duration is not None and beat.qt_interval is not None:
+            annotated.append(beat)
+        else:
+            unannotated.append(beat)
+    return annotated, unannotated, noisy
+
+
 def load_patient_beats(folders, ecg_filename="ecg_data.txt"):
     """Process a list of patient folders and partition beats by quality.
 
@@ -551,26 +573,19 @@ def load_patient_beats(folders, ecg_filename="ecg_data.txt"):
     noisy       : list[Beat]  beats whose window overlaps another beat's window
                               (these may also appear in annotated/unannotated)
     """
+    from concurrent.futures import ProcessPoolExecutor
+    import os as _os
+
     annotated   = []
     unannotated = []
     noisy       = []
 
-    for folder in folders:
-        filepath = os.path.join(folder, ecg_filename)
-        if not os.path.isfile(filepath):
-            continue
-        try:
-            beats, _, _ = process_study(filepath)
-        except Exception:
-            continue
-
-        for beat in beats:
-            if beat.noisy:
-                noisy.append(beat)
-            elif beat.qrs_duration is not None and beat.qt_interval is not None:
-                annotated.append(beat)
-            else:
-                unannotated.append(beat)
+    args = [(f, ecg_filename) for f in folders]
+    with ProcessPoolExecutor(max_workers=_os.cpu_count()) as pool:
+        for ann, unann, noisy_f in pool.map(_process_folder, args):
+            annotated.extend(ann)
+            unannotated.extend(unann)
+            noisy.extend(noisy_f)
 
     return annotated, unannotated, noisy
 
