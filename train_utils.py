@@ -12,6 +12,41 @@ Covers:
 
 import os
 import sys
+
+def _np_save_atomic(path, arr):
+    """Write numpy array atomically (temp file + rename) to avoid partial writes."""
+    dirpath = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(suffix='.npy', dir=dirpath)
+    os.close(fd)
+    np.save(tmp, arr)
+    os.replace(tmp, path)
+
+
+def _load_all_leads(path, expected_n):
+    """Load all_leads cache, discarding the file if missing, corrupt, or wrong size."""
+    if not os.path.exists(path):
+        return None
+    try:
+        al = torch.from_numpy(np.load(path))
+    except Exception as e:
+        print(f'  [cache] all_leads unreadable ({e}) — discarding')
+        os.remove(path)
+        return None
+    if al.shape[0] != expected_n:
+        print(f'  [cache] all_leads size mismatch ({al.shape[0]} vs {expected_n}) — discarding')
+        os.remove(path)
+        return None
+    return al
+
+
+def _pad_to_13(window):
+    """Pad (n_leads, W) to (13, W) so all beats stack uniformly.
+    Leads 0-11: ECG; lead 12: stimulus (zeros if absent).
+    """
+    w = window.astype(np.float32)
+    if w.shape[0] < 13:
+        w = np.concatenate([w, np.zeros((13 - w.shape[0], w.shape[1]), dtype=np.float32)], axis=0)
+    return w[:13, :]
 import pickle
 import subprocess
 import tempfile
@@ -40,14 +75,50 @@ def dispatch_debug_plot(**kwargs):
 
     Each invocation starts a clean interpreter so edits to debug_plot.py
     are picked up on the next tick without restarting training.
+
+    Also writes metrics.csv and summary.txt to out_dir for quick cross-run search.
     """
     _prune_procs()
+
+    history  = kwargs.get('history', [])
+    out_dir  = kwargs.get('out_dir', 'debug')
+    epoch    = kwargs.get('epoch', 0)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # ── metrics.csv: one row per epoch, overwritten each tick ─────
+    if history:
+        csv_path = os.path.join(out_dir, '..', 'metrics.csv')
+        csv_path = os.path.normpath(csv_path)
+        cols = list(history[0].keys())
+        with open(csv_path, 'w') as f:
+            f.write(','.join(cols) + '\n')
+            for row in history:
+                f.write(','.join(str(row.get(c, '')) for c in cols) + '\n')
+
+        # ── summary.txt: best + latest ────────────────────────────
+        best_va = min(history, key=lambda r: r.get('va_qrs', float('inf')) + r.get('va_qt', float('inf')))
+        best_ho = min(history, key=lambda r: r.get('ho_qrs', float('inf')) + r.get('ho_qt', float('inf')))
+        last    = history[-1]
+        lines = [
+            f"run_dir : {os.path.normpath(os.path.join(out_dir, '..'))}",
+            f"epoch   : {epoch}",
+            f"latest  : tr_qrs={last.get('tr_qrs',''):.1f}  tr_qt={last.get('tr_qt',''):.1f}"
+            f"  va_qrs={last.get('va_qrs',''):.1f}  va_qt={last.get('va_qt',''):.1f}"
+            f"  ho_qrs={last.get('ho_qrs',''):.1f}  ho_qt={last.get('ho_qt',''):.1f}",
+            f"best_va : epoch={best_va['epoch']}  va_qrs={best_va.get('va_qrs',''):.1f}  va_qt={best_va.get('va_qt',''):.1f}"
+            f"  (ho_qrs={best_va.get('ho_qrs',''):.1f}  ho_qt={best_va.get('ho_qt',''):.1f})",
+            f"best_ho : epoch={best_ho['epoch']}  ho_qrs={best_ho.get('ho_qrs',''):.1f}  ho_qt={best_ho.get('ho_qt',''):.1f}"
+            f"  (va_qrs={best_ho.get('va_qrs',''):.1f}  va_qt={best_ho.get('va_qt',''):.1f})",
+        ]
+        with open(os.path.join(out_dir, '..', 'summary.txt'), 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+
     fd, tmp_path = tempfile.mkstemp(suffix='.pkl')
     with os.fdopen(fd, 'wb') as f:
         pickle.dump(kwargs, f)
     proc = subprocess.Popen([sys.executable, _WORKER, tmp_path])
     _plot_procs.append(proc)
-    tqdm.write(f'  [plot] dispatched epoch {kwargs.get("epoch", 0)} → {kwargs.get("out_dir", "debug")}')
+    tqdm.write(f'  [plot] dispatched epoch {epoch} → {out_dir}')
 
 
 # =========================================================
@@ -93,222 +164,59 @@ def _ys_valid(base):
     return np.load(path).ndim == 3
 
 
-# =========================================================
-# Model / head loading
-# =========================================================
-
-class _ModelWithHead:
-    """Thin wrapper so head-only code looks the same as a full HuBERTECGRegressor."""
-    def __init__(self, head):
-        self.head = head
-
-
-def load_or_build_model(cache_dir, force, device, width,
-                        train_folders, holdout_folders,
-                        extra_caches=()):
-    """Load HuBERT + build MaskHead, or skip HuBERT if all caches are present.
-
-    Parameters
-    ----------
-    extra_caches : iterable of cache base paths
-        Additional caches that must exist before HuBERT loading is skipped.
-        Pass the unannotated cache path here when using train_semi.py.
-    """
-    from model import MaskHead, build_model
-    from beat import WINDOW_PRE, WINDOW_POST
-
-    train_cp   = emb_cache_path(cache_dir, train_folders,   'train')
-    holdout_cp = emb_cache_path(cache_dir, holdout_folders, 'holdout')
-    cfg_path   = os.path.join(cache_dir, 'model_config.pt')
-
-    all_cached = (
-        not force
-        and _emb_cache_exists(train_cp)
-        and _emb_cache_exists(holdout_cp)
-        and os.path.exists(cfg_path)
-        and all(_unann_cache_exists(p) for p in extra_caches)
-    )
-
-    if all_cached:
-        cfg = torch.load(cfg_path, map_location='cpu', weights_only=True)
-        print(f'  [cache] skipping HuBERT load — building head from {cfg_path}')
-        head = MaskHead(
-            embed_dim=cfg['embed_dim'],
-            window_size=WINDOW_PRE + WINDOW_POST,
-            width=width,
-        ).to(device)
-        return _ModelWithHead(head)
-
-    model, _ = build_model(device=device, width=width)
-    os.makedirs(cache_dir, exist_ok=True)
-    torch.save(
-        dict(embed_dim=model.encoder.config.hidden_size,
-             embed_L=model.L,
-             embed_t=model.t),
-        cfg_path,
-    )
-    print(f'  [cache] saved model config to {cfg_path}')
-    return model
+def _decisions_valid(base):
+    """True if the decisions cache exists and has the 12-lead shape (N, 12, W)."""
+    from beat import PT_N_LEADS
+    path = f'{base}_decisions.npy'
+    if not os.path.exists(path):
+        return False
+    arr = np.load(path)
+    return arr.ndim == 3 and arr.shape[1] == PT_N_LEADS
 
 
 # =========================================================
-# Annotated embedding precomputation
+# Cache loaders  (run precompute.py first)
 # =========================================================
 
-@torch.no_grad()
-def precompute_embeddings(model, dataset, batch_size, device, desc=''):
-    """Run the frozen encoder once; returns (embs, decisions, ys, lead2) on CPU."""
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
-                        num_workers=4, pin_memory=True)
-    embs, decisions, ys = [], [], []
-    model.eval()
-    for x, d, y in tqdm(loader, desc=desc, leave=False):
-        x = x.to(device, non_blocking=True)
-        embs.append(model.encode(x).cpu())
-        decisions.append(d)
-        ys.append(y)
-    lead2 = torch.from_numpy(
-        np.stack([b.window[2, :].astype(np.float32) for b in dataset.beats])
-    )
-    return torch.cat(embs), torch.cat(decisions), torch.cat(ys), lead2
+def load_cache(cache_path):
+    """Load precomputed annotated cache.  Exits with a clear message if missing."""
+    for suffix in ('_embs.npy', '_decisions.npy', '_ys.npy'):
+        if not os.path.exists(f'{cache_path}{suffix}'):
+            sys.exit(f'Cache missing: {cache_path}{suffix}\nRun: python precompute.py')
+    embs      = _load_embs(cache_path)
+    decisions = torch.from_numpy(np.load(f'{cache_path}_decisions.npy'))
+    ys        = torch.from_numpy(np.load(f'{cache_path}_ys.npy'))
+    all_leads = _load_all_leads(f'{cache_path}_all_leads.npy', embs.shape[0])
+    print(f'  [cache] {cache_path}_* ({len(embs)} beats)')
+    return embs, decisions, ys, all_leads
 
 
-def load_or_precompute(model, dataset, batch_size, device,
-                       cache_path, force=False, desc=''):
-    """Load annotated embeddings from cache, or precompute and save."""
-    lead2_path = f'{cache_path}_lead2.npy'
-
-    if not force and _emb_cache_exists(cache_path):
-        ys_raw = np.load(f'{cache_path}_ys.npy')
-        if ys_raw.ndim == 3:
-            print(f'  [cache] loading {cache_path}_*')
-            embs      = _load_embs(cache_path)
-            decisions = torch.from_numpy(np.load(f'{cache_path}_decisions.npy'))
-            lead2     = (torch.from_numpy(np.load(lead2_path))
-                         if os.path.exists(lead2_path) else None)
-            return embs, decisions, torch.from_numpy(ys_raw), lead2
-
-        # embs+decisions are fine; only ys are stale — rebuild without re-encoding
-        print(f'  [cache] stale ys {ys_raw.shape} — rebuilding (no re-encoding)')
-        embs      = _load_embs(cache_path)
-        decisions = torch.from_numpy(np.load(f'{cache_path}_decisions.npy'))
-        ys = torch.stack([dataset[i][2] for i in range(len(dataset))])
-        np.save(f'{cache_path}_ys.npy', ys.numpy())
-        lead2 = (torch.from_numpy(np.load(lead2_path))
-                 if os.path.exists(lead2_path) else None)
-        return embs, decisions, ys, lead2
-
-    embs, decisions, ys, lead2 = precompute_embeddings(
-        model, dataset, batch_size, device, desc=desc)
-    os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
-    _save_embs(cache_path, embs)
-    np.save(f'{cache_path}_decisions.npy', decisions.numpy())
-    np.save(f'{cache_path}_ys.npy',        ys.numpy())
-    np.save(lead2_path,                    lead2.numpy())
-    print(f'  [cache] saved {cache_path}_*')
-    return embs, decisions, ys, lead2
-
-
-# =========================================================
-# Unannotated embedding precomputation
-# =========================================================
-
-@torch.no_grad()
-def precompute_embeddings_unann(model, dataset, batch_size, device, desc=''):
-    """Like precompute_embeddings but skips ys (unannotated beats have no labels)."""
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
-                        num_workers=4, pin_memory=True)
-    embs, decisions = [], []
-    model.eval()
-    for x, d, _y in tqdm(loader, desc=desc, leave=False):
-        x = x.to(device, non_blocking=True)
-        embs.append(model.encode(x).cpu())
-        decisions.append(d)
-    return torch.cat(embs), torch.cat(decisions)
-
-
-def load_or_precompute_unann(model, dataset, batch_size, device,
-                             cache_path, force=False, desc=''):
-    """Load unannotated embeddings from cache, or precompute and save."""
-    if not force and _unann_cache_exists(cache_path):
-        print(f'  [cache] loading {cache_path}_embs/decisions')
-        embs      = _load_embs(cache_path)
-        decisions = torch.from_numpy(np.load(f'{cache_path}_decisions.npy'))
-        return embs, decisions
-
-    embs, decisions = precompute_embeddings_unann(
-        model, dataset, batch_size, device, desc=desc)
-    os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
-    _save_embs(cache_path, embs)
-    np.save(f'{cache_path}_decisions.npy', decisions.numpy())
-    print(f'  [cache] saved {cache_path}_embs.pt / decisions.npy')
+def load_cache_unann(cache_path):
+    """Load precomputed unannotated cache (embs + decisions only)."""
+    for suffix in ('_embs.npy', '_decisions.npy'):
+        if not os.path.exists(f'{cache_path}{suffix}'):
+            sys.exit(f'Cache missing: {cache_path}{suffix}\nRun: python precompute.py')
+    embs      = _load_embs(cache_path)
+    decisions = torch.from_numpy(np.load(f'{cache_path}_decisions.npy'))
+    print(f'  [cache] {cache_path}_embs/decisions ({len(embs)} beats)')
     return embs, decisions
 
 
-# =========================================================
-# PT-only decision precomputation  (no encoder)
-# =========================================================
-
-def load_decisions(dataset, batch_size, desc=''):
-    """Collect decision windows and targets without running any encoder."""
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
-                        num_workers=4, pin_memory=True)
-    decisions, ys = [], []
-    for _, d, y in tqdm(loader, desc=desc, leave=False):
-        decisions.append(d)
-        ys.append(y)
-    lead2 = torch.from_numpy(
-        np.stack([b.window[2, :].astype(np.float32) for b in dataset.beats])
-    )
-    return torch.cat(decisions), torch.cat(ys), lead2
-
-
-def load_or_precompute_pt(dataset, batch_size, cache_path, force=False, desc=''):
-    """Load decisions+ys from cache (shared format), or compute from dataset.
-
-    Used by train_pt.py — no encoder, so embs are not stored/needed.
-    """
-    lead2_path = f'{cache_path}_lead2.npy'
-
-    if not force and _emb_cache_exists(cache_path) and _ys_valid(cache_path):
-        print(f'  [cache] loading {cache_path}_decisions/ys.npy')
-        decisions = torch.from_numpy(np.load(f'{cache_path}_decisions.npy'))
-        ys        = torch.from_numpy(np.load(f'{cache_path}_ys.npy'))
-        lead2     = (torch.from_numpy(np.load(lead2_path))
-                     if os.path.exists(lead2_path) else None)
-        return decisions, ys, lead2
-
-    decisions, ys, lead2 = load_decisions(dataset, batch_size, desc=desc)
-    os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
-    np.save(f'{cache_path}_decisions.npy', decisions.numpy())
-    np.save(f'{cache_path}_ys.npy',        ys.numpy())
-    np.save(lead2_path,                    lead2.numpy())
-    print(f'  [cache] saved {cache_path}_decisions/ys/lead2.npy')
-    return decisions, ys, lead2
+def load_cache_pt(cache_path):
+    """Load decisions + ys only (PT baseline — no embeddings needed)."""
+    for suffix in ('_decisions.npy', '_ys.npy'):
+        if not os.path.exists(f'{cache_path}{suffix}'):
+            sys.exit(f'Cache missing: {cache_path}{suffix}\nRun: python precompute.py')
+    decisions = torch.from_numpy(np.load(f'{cache_path}_decisions.npy'))
+    ys        = torch.from_numpy(np.load(f'{cache_path}_ys.npy'))
+    all_leads = _load_all_leads(f'{cache_path}_all_leads.npy', decisions.shape[0])
+    print(f'  [cache] {cache_path}_decisions/ys ({len(decisions)} beats)')
+    return decisions, ys, all_leads
 
 
 # =========================================================
 # Eval helpers
 # =========================================================
-
-@torch.no_grad()
-def collect_predictions(head, loader, device):
-    """Return (preds_ms, targets_ms) as numpy arrays of shape (N, 2).
-    QT column is zeroed while the head only predicts QRS.
-    """
-    head.eval()
-    preds, targets = [], []
-    for emb, d, y_mask in loader:
-        emb    = emb.to(device, non_blocking=True)
-        d      = d.to(device, non_blocking=True)
-        y_mask = y_mask.to(device, non_blocking=True)
-        _, mask, _ = head(emb, d)
-        hard_dur = (mask > 0.5).float().sum(dim=-1)
-        pad = torch.zeros_like(hard_dur)
-        preds.append(torch.cat([hard_dur, pad], dim=-1).cpu())
-        targets.append(y_mask.sum(dim=-1).cpu())
-    return torch.cat(preds).numpy(), torch.cat(targets).numpy()
-
 
 @torch.no_grad()
 def pick_best_worst(head, emb, decision, y_mask, device):
@@ -322,52 +230,21 @@ def pick_best_worst(head, emb, decision, y_mask, device):
 
 
 @torch.no_grad()
-def collect_sample_logits(head, emb, decision, y_mask, lead2, device):
+def collect_sample_logits(head, emb, decision, y_mask, all_leads, device):
     """Run forward_debug on pre-selected samples; returns dict of numpy arrays."""
     head.eval()
     emb      = emb.to(device)
     decision = decision.to(device)
     logits, mask, _, f_sig, g_sig = head.forward_debug(emb, decision)
     return {
-        'logits':   logits.cpu().numpy(),
-        'mask':     mask.cpu().numpy(),
-        'f_sig':    f_sig.cpu().numpy(),
-        'g_sig':    g_sig.cpu().numpy(),
-        'decision': decision.cpu().numpy(),
-        'y_mask':   y_mask.numpy(),
-        'lead2':    lead2.numpy() if lead2 is not None else None,
+        'logits':     logits.cpu().numpy(),
+        'mask':       mask.cpu().numpy(),
+        'f_sig':      f_sig.cpu().numpy(),
+        'g_sig':      g_sig.cpu().numpy(),
+        'decision':   decision.cpu().numpy(),
+        'y_mask':     y_mask.numpy(),
+        'all_leads':  all_leads.numpy() if all_leads is not None else None,
     }
-
-
-def build_sample_data(head, splits, device):
-    """Collect best+worst sample logits across train/val/holdout splits.
-
-    Parameters
-    ----------
-    splits : list of (name, embs, decisions, ys, lead2)
-
-    Returns
-    -------
-    sample_data : dict of concatenated numpy arrays
-    labels      : list of strings  e.g. ['train (best)', 'train (worst)', ...]
-    """
-    parts, labels = [], []
-    for name, embs, decisions, ys, lead2 in splits:
-        bi, wi = pick_best_worst(head, embs, decisions, ys, device)
-        for idx, tag in ((bi, 'best'), (wi, 'worst')):
-            l2_sel = lead2[[idx]] if lead2 is not None else None
-            parts.append(collect_sample_logits(
-                head, embs[[idx]], decisions[[idx]], ys[[idx]], l2_sel, device))
-            labels.append(f'{name} ({tag})')
-
-    keys = ['logits', 'mask', 'f_sig', 'g_sig', 'decision', 'y_mask']
-    sample_data = {k: np.concatenate([p[k] for p in parts], axis=0) for k in keys}
-    l2_parts = [p['lead2'] for p in parts]
-    sample_data['lead2'] = (
-        np.concatenate(l2_parts, axis=0)
-        if all(x is not None for x in l2_parts) else None
-    )
-    return sample_data, labels
 
 
 # =========================================================

@@ -16,14 +16,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from tqdm import tqdm
 
-from beat import load_or_process_beats
-from dataset import BeatDataset, preprocess_hubert
 from model import PTHead
 from train_utils import (
     dispatch_debug_plot,
-    emb_cache_path, _emb_cache_exists, _ys_valid,
-    load_or_precompute_pt,
-    collect_predictions, build_sample_data,
+    emb_cache_path, load_cache_pt,
+    collect_sample_logits,
     tv_loss,
 )
 
@@ -32,12 +29,17 @@ from train_utils import (
 # Train / eval
 # =========================================================
 
-def run_epoch(head, loader, optimizer, device, train=True, lambda_tv=1.0):
+def run_epoch(head, loader, optimizer, device, train=True, lambda_tv=1.0, collect=False):
     head.train(train)
     total_bce = total_qrs = n = 0
 
+    if collect:
+        all_preds, all_targets = [], []
+        best_err, worst_err = float('inf'), float('-inf')
+        best_sample = worst_sample = None
+
     with torch.set_grad_enabled(train):
-        for emb, d, y_mask in loader:
+        for emb, d, y_mask, l2 in loader:
             emb    = emb.to(device, non_blocking=True)
             d      = d.to(device, non_blocking=True)
             y_mask = y_mask.to(device, non_blocking=True)
@@ -57,12 +59,30 @@ def run_epoch(head, loader, optimizer, device, train=True, lambda_tv=1.0):
                 hard_dur = (mask > 0.5).float().sum(dim=-1)
                 qrs_mae  = (hard_dur[:, 0] - true_dur[:, 0]).abs().mean().item()
 
+            if collect:
+                pad = torch.zeros_like(hard_dur)
+                all_preds.append(torch.cat([hard_dur, pad], dim=-1).cpu().numpy())
+                all_targets.append(true_dur.cpu().numpy())
+                errs = (hard_dur[:, 0] - true_dur[:, 0]).abs()
+                bi = errs.argmin().item()
+                wi = errs.argmax().item()
+                if errs[bi].item() < best_err:
+                    best_err = errs[bi].item()
+                    best_sample = (emb[[bi]].cpu(), d[[bi]].cpu(), y_mask[[bi]].cpu(), l2[[bi]])
+                if errs[wi].item() > worst_err:
+                    worst_err = errs[wi].item()
+                    worst_sample = (emb[[wi]].cpu(), d[[wi]].cpu(), y_mask[[wi]].cpu(), l2[[wi]])
+
             B = d.size(0)
             total_bce += loss.item() * B
             total_qrs += qrs_mae     * B
             n         += B
 
-    return total_bce / n, total_qrs / n, 0.0
+    metrics = total_bce / n, total_qrs / n, 0.0
+    if not collect:
+        return metrics
+    return metrics + ({'preds': np.concatenate(all_preds), 'targets': np.concatenate(all_targets),
+                       'best': best_sample, 'worst': worst_sample},)
 
 
 # =========================================================
@@ -83,40 +103,28 @@ def main(args):
     print(f'Train folders   : {[os.path.basename(f) for f in train_folders]}')
     print(f'Holdout folders : {[os.path.basename(f) for f in holdout_folders]}')
 
-    train_cp   = emb_cache_path(args.cache_dir, train_folders,   'train')
+    train_tag  = f'train_aug{args.augment_seed}' if args.augment else 'train'
+    train_cp   = emb_cache_path(args.cache_dir, train_folders,   train_tag)
     holdout_cp = emb_cache_path(args.cache_dir, holdout_folders, 'holdout')
-    need_beats = (args.force
-                  or not (_emb_cache_exists(train_cp) and _emb_cache_exists(holdout_cp))
-                  or not (_ys_valid(train_cp) and _ys_valid(holdout_cp)))
 
-    if need_beats:
-        print('Loading / processing beats...')
-        train_ann, _, _   = load_or_process_beats(train_folders,   args.cache_dir, args.force)
-        holdout_ann, _, _ = load_or_process_beats(holdout_folders, args.cache_dir, args.force)
-        train_ds_full = BeatDataset(train_ann,   transform=preprocess_hubert)
-        holdout_ds    = BeatDataset(holdout_ann, transform=preprocess_hubert)
-    else:
-        print('  [cache] decisions found — skipping beat load')
-        train_ds_full = holdout_ds = None
-
-    print('Collecting decision windows (no encoder needed)...')
-    decisions,    ys,    lead2    = load_or_precompute_pt(
-        train_ds_full, args.batch_size, train_cp,   args.force, '  train  ')
-    ho_decisions, ho_ys, ho_lead2 = load_or_precompute_pt(
-        holdout_ds,    args.batch_size, holdout_cp, args.force, '  holdout')
+    print('Loading cache...')
+    decisions,    ys,    lead2    = load_cache_pt(train_cp)
+    ho_decisions, ho_ys, ho_lead2 = load_cache_pt(holdout_cp)
 
     # PTHead ignores embeddings — pass dummy zeros
     dummy    = torch.zeros(len(decisions),    1, 1, 1)
     ho_dummy = torch.zeros(len(ho_decisions), 1, 1, 1)
 
-    full_ds = TensorDataset(dummy, decisions, ys)
+    _l2_tr = lead2    if lead2    is not None else torch.zeros(len(decisions),    ys.shape[-1])
+    _l2_ho = ho_lead2 if ho_lead2 is not None else torch.zeros(len(ho_decisions), ho_ys.shape[-1])
+    full_ds = TensorDataset(dummy, decisions, ys, _l2_tr)
     n_val   = max(1, int(len(full_ds) * args.val_split))
     n_train = len(full_ds) - n_val
     train_ds, val_ds = random_split(
         full_ds, [n_train, n_val],
         generator=torch.Generator().manual_seed(args.seed),
     )
-    holdout_full_ds = TensorDataset(ho_dummy, ho_decisions, ho_ys)
+    holdout_full_ds = TensorDataset(ho_dummy, ho_decisions, ho_ys, _l2_ho)
     print(f'Train / Val / Holdout ({holdout_pat}) : {n_train} / {n_val} / {len(holdout_full_ds)}')
 
     train_dl   = DataLoader(train_ds,        batch_size=args.batch_size, shuffle=True,  pin_memory=True)
@@ -124,6 +132,7 @@ def main(args):
     holdout_dl = DataLoader(holdout_full_ds, batch_size=args.batch_size, shuffle=False, pin_memory=True)
 
     head = PTHead().to(device)
+    print(head)
 
     optimizer = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.wd)
     warmup_epochs = max(1, args.epochs // 10)
@@ -152,9 +161,10 @@ def main(args):
 
     bar = tqdm(range(1, args.epochs + 1), desc='training', unit='ep')
     for epoch in bar:
-        tr_bce, tr_qrs, tr_qt = run_epoch(head, train_dl,   optimizer, device, train=True)
-        va_bce, va_qrs, va_qt = run_epoch(head, val_dl,     optimizer, device, train=False)
-        ho_bce, ho_qrs, ho_qt = run_epoch(head, holdout_dl, optimizer, device, train=False)
+        do_collect = args.plot_every > 0 and (epoch % args.plot_every == 0 or epoch == args.epochs)
+        tr_bce, tr_qrs, tr_qt, *tr_c = run_epoch(head, train_dl,   optimizer, device, train=True,  collect=do_collect)
+        va_bce, va_qrs, va_qt, *va_c = run_epoch(head, val_dl,     optimizer, device, train=False, collect=do_collect)
+        ho_bce, ho_qrs, ho_qt, *ho_c = run_epoch(head, holdout_dl, optimizer, device, train=False, collect=do_collect)
         scheduler.step()
 
         best_val = min(best_val, va_qrs + va_qt)
@@ -173,21 +183,28 @@ def main(args):
             lr=f'{scheduler.get_last_lr()[0]:.2e}',
         )
 
-        if args.plot_every > 0 and (epoch % args.plot_every == 0 or epoch == args.epochs):
-            tr_idx = torch.tensor(train_ds.indices)
-            va_idx = torch.tensor(val_ds.indices)
+        if do_collect:
+            tr_col, va_col, ho_col = tr_c[0], va_c[0], ho_c[0]
             plot_data = {
-                'train':   collect_predictions(head, train_dl,   device),
-                'val':     collect_predictions(head, val_dl,     device),
-                'holdout': collect_predictions(head, holdout_dl, device),
+                'train':   (tr_col['preds'], tr_col['targets']),
+                'val':     (va_col['preds'], va_col['targets']),
+                'holdout': (ho_col['preds'], ho_col['targets']),
             }
-            sample_data, labels = build_sample_data(head, [
-                ('train',   dummy[tr_idx], decisions[tr_idx], ys[tr_idx],
-                 lead2[tr_idx] if lead2 is not None else None),
-                ('val',     dummy[va_idx], decisions[va_idx], ys[va_idx],
-                 lead2[va_idx] if lead2 is not None else None),
-                ('holdout', ho_dummy, ho_decisions, ho_ys, ho_lead2),
-            ], device)
+            parts, labels = [], []
+            for name, col in [('train', tr_col), ('val', va_col), ('holdout', ho_col)]:
+                for tag, samp in [('best', col['best']), ('worst', col['worst'])]:
+                    e, d_s, y, l2 = samp
+                    parts.append(collect_sample_logits(head, e, d_s, y, l2, device))
+                    labels.append(f'{name} ({tag})')
+            keys = ['logits', 'mask', 'f_sig', 'g_sig', 'decision', 'y_mask']
+            sample_data = {k: np.concatenate([p[k] for p in parts], axis=0) for k in keys}
+            l2_parts = [p['lead2'] for p in parts]
+            sample_data['lead2'] = (
+                np.concatenate(l2_parts, axis=0)
+                if all(x is not None for x in l2_parts) else None
+            )
+            if lead2 is None and ho_lead2 is None:
+                sample_data['lead2'] = None
             sample_data['labels'] = labels
             dispatch_debug_plot(
                 epoch=epoch, history=history,
@@ -224,7 +241,9 @@ if __name__ == '__main__':
     parser.add_argument('--plots_dir',       default=None,
                         help='output folder for debug plots (default: <ckpt_dir>/debug)')
     parser.add_argument('--cache_dir',       default='cache')
-    parser.add_argument('--force',           action='store_true',
-                        help='recompute and overwrite all caches')
+    parser.add_argument('--augment',         action='store_true',
+                        help='expand training set 10x with scale+shift augmentation')
+    parser.add_argument('--augment_seed',    type=int, default=42,
+                        help='RNG seed for augmentation (also used as cache key)')
     args = parser.parse_args()
     main(args)

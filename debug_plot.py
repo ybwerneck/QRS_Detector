@@ -168,12 +168,12 @@ def _plot_sample_logits(sample_data=None, **kwargs):
     if sample_data is None:
         return None
 
-    logits   = sample_data['logits']    # (N, 1, 550)
-    mask     = sample_data['mask']      # (N, 1, 550)
-    f_sig    = sample_data['f_sig']     # (N, 1, 550)
-    g_sig    = sample_data['g_sig']     # (N, 1, 550)
-    y_mask   = sample_data['y_mask']    # (N, 2, 550)
-    lead2    = sample_data.get('lead2') # (N, 550) or None
+    logits    = sample_data['logits']      # (N, 1, 550)
+    mask      = sample_data['mask']       # (N, 1, 550)
+    f_sig     = sample_data['f_sig']      # (N, 1, 550)
+    g_sig     = sample_data['g_sig']      # (N, 1, 550)
+    y_mask    = sample_data['y_mask']     # (N, 2, 550)
+    all_leads = sample_data.get('all_leads')  # (N, 12, 550) or None
 
     labels = sample_data.get('labels')  # list of str or None
     n = len(logits)
@@ -187,48 +187,60 @@ def _plot_sample_logits(sample_data=None, **kwargs):
         gt  = y_mask[i, 0]          # QRS GT mask
         mk  = mask[i, 0]
         lg  = logits[i, 0]
-        f   = f_sig[i, 0]
-        g   = g_sig[i, 0]
 
         pred_dur = mk.sum()
         gt_dur   = gt.sum()
         row_label = labels[i] if labels is not None else f'sample {i+1}'
 
-        # ── col 0: lead II + GT ───────────────────────────────────
+        # ── col 0: all 12 leads superimposed + GT ────────────────
         ax = axes[i, 0]
-        if lead2 is not None:
-            sig   = lead2[i]
-            sig_n = (sig - sig.mean()) / (sig.std() + 1e-8)
-            ax.plot(t, sig_n, color='#333333', linewidth=0.8, label='lead II')
+        if all_leads is not None:
+            ecg = all_leads[i]          # (13, W): leads 0-11 ECG, 12 stimulus
+            offset_step = 1.5
+            cmap = plt.cm.tab20(np.linspace(0, 0.9, 12))
+            for li in range(12):
+                sig = ecg[li]
+                sig_n = (sig - sig.mean()) / (sig.std() + 1e-8)
+                ax.plot(t, sig_n + li * offset_step, color=cmap[li],
+                        linewidth=0.6, alpha=0.75)
+            # stimulus channel (lead 12) — only if present (non-zero)
+            stim = ecg[12]
+            if stim.any():
+                ax.plot(t, stim / (stim.max() + 1e-8) * 1.2 + 12 * offset_step,
+                        color='crimson', linewidth=0.8, alpha=0.9, label='stimulus')
         else:
-            ax.text(0.5, 0.5, 'lead2 unavailable', transform=ax.transAxes,
+            ax.text(0.5, 0.5, 'leads unavailable', transform=ax.transAxes,
                     ha='center', va='center', fontsize=8, color='grey')
         ax2 = ax.twinx()
         ax2.fill_between(t, 0, gt, color='seagreen', alpha=0.25, label='GT')
         ax2.set_ylim(-0.1, 1.5)
         ax2.set_yticks([])
-        ax.set_ylabel('lead II (norm)', fontsize=7)
+        ax.set_ylabel('leads (norm + offset)', fontsize=7)
         ax.set_xlabel('time (ms)', fontsize=7)
+        ax.set_yticks([])
         ax.tick_params(labelsize=6)
-        ax.set_title(f'{row_label} — lead II', fontsize=8)
+        ax.set_title(f'{row_label} — 12-lead ECG', fontsize=8)
         ax.grid(alpha=0.15)
-        handles = []
-        if lead2 is not None:
-            handles.append(plt.Line2D([0], [0], color='#333333', label='lead II'))
-        handles.append(Patch(color='seagreen', alpha=0.4, label='GT QRS'))
+        handles = [Patch(color='seagreen', alpha=0.4, label='GT QRS')]
         ax.legend(handles=handles, fontsize=7, loc='upper right')
 
         # ── col 1: f (PT branch) and g (EMB branch) ──────────────
         ax = axes[i, 1]
+        f = f_sig[i, 0]
+        g = g_sig[i, 0]
         ax.fill_between(t, 0, gt, color='seagreen', alpha=0.15)
         ax.plot(t, f, color='steelblue',  linewidth=1.0, label='f  (PT branch)')
         ax.plot(t, g, color='darkorange', linewidth=1.0, label='g  (EMB branch)')
-        #ax.set_ylim(-2, 2)
-        ax.set_ylabel('sigmoid output', fontsize=7)
+        ax.set_ylabel('z-scored prior', fontsize=7)
         ax.set_xlabel('time (ms)', fontsize=7)
         ax.tick_params(labelsize=6)
         ax.set_title(f'{row_label} — branch priors', fontsize=8)
-        ax.legend(fontsize=7, loc='upper right')
+        handles = [
+            plt.Line2D([0], [0], color='steelblue',  label='f  (PT branch)'),
+            plt.Line2D([0], [0], color='darkorange',  label='g  (EMB branch)'),
+            Patch(color='seagreen', alpha=0.4,        label='GT QRS'),
+        ]
+        ax.legend(handles=handles, fontsize=7, loc='upper right')
         ax.grid(alpha=0.2)
 
         # ── col 2: final logit + predicted mask ───────────────────
@@ -257,7 +269,7 @@ def _plot_sample_logits(sample_data=None, **kwargs):
         ]
         ax.legend(handles=handles, fontsize=7, loc='upper right')
 
-    fig.suptitle('Sample debug — lead II / branch priors / fusion', fontsize=10)
+    fig.suptitle('Sample debug — 12-lead ECG / branch priors / fusion', fontsize=10)
     plt.tight_layout()
     return fig
 

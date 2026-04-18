@@ -21,13 +21,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from tqdm import tqdm
 
-from beat import load_or_process_beats
-from dataset import BeatDataset, preprocess_hubert
 from train_utils import (
     dispatch_debug_plot,
-    emb_cache_path, _emb_cache_exists, _unann_cache_exists, _ys_valid,
-    load_or_build_model, load_or_precompute, load_or_precompute_unann,
-    collect_predictions, build_sample_data,
+    emb_cache_path, load_cache, load_cache_unann,
+    collect_sample_logits,
     tv_loss, dur_prior_loss,
 )
 
@@ -38,12 +35,17 @@ from train_utils import (
 
 def run_epoch(head, ann_loader, unann_iter, optimizer, device,
               train=True, scaler=None, lambda_tv_ann=0.2, lambda_tv_unann=1.0,
-              lambda_dur=0.0, ann_dur_mu=None, dur_delta=100.0):
+              lambda_dur=0.0, ann_dur_mu=None, dur_delta=100.0, collect=False):
     head.train(train)
     total_bce = total_qrs = n = 0
 
+    if collect:
+        all_preds, all_targets = [], []
+        best_err, worst_err = float('inf'), float('-inf')
+        best_sample = worst_sample = None
+
     with torch.set_grad_enabled(train):
-        for emb, d, y_mask in ann_loader:
+        for emb, d, y_mask, l2 in ann_loader:
             emb    = emb.to(device, non_blocking=True)
             d      = d.to(device, non_blocking=True)
             y_mask = y_mask.to(device, non_blocking=True)
@@ -71,12 +73,30 @@ def run_epoch(head, ann_loader, unann_iter, optimizer, device,
                 hard_dur = (mask > 0.5).float().sum(dim=-1)
                 qrs_mae  = (hard_dur[:, 0] - true_dur[:, 0]).abs().mean().item()
 
+            if collect:
+                pad = torch.zeros_like(hard_dur)
+                all_preds.append(torch.cat([hard_dur, pad], dim=-1).cpu().numpy())
+                all_targets.append(true_dur.cpu().numpy())
+                errs = (hard_dur[:, 0] - true_dur[:, 0]).abs()
+                bi = errs.argmin().item()
+                wi = errs.argmax().item()
+                if errs[bi].item() < best_err:
+                    best_err = errs[bi].item()
+                    best_sample = (emb[[bi]].cpu(), d[[bi]].cpu(), y_mask[[bi]].cpu(), l2[[bi]])
+                if errs[wi].item() > worst_err:
+                    worst_err = errs[wi].item()
+                    worst_sample = (emb[[wi]].cpu(), d[[wi]].cpu(), y_mask[[wi]].cpu(), l2[[wi]])
+
             B = emb.size(0)
             total_bce += loss.item() * B
             total_qrs += qrs_mae     * B
             n         += B
 
-    return total_bce / n, total_qrs / n, 0.0
+    metrics = total_bce / n, total_qrs / n, 0.0
+    if not collect:
+        return metrics
+    return metrics + ({'preds': np.concatenate(all_preds), 'targets': np.concatenate(all_targets),
+                       'best': best_sample, 'worst': worst_sample},)
 
 
 # =========================================================
@@ -97,75 +117,33 @@ def main(args):
     print(f'Train folders   : {[os.path.basename(f) for f in train_folders]}')
     print(f'Holdout folders : {[os.path.basename(f) for f in holdout_folders]}')
 
-    train_cp   = emb_cache_path(args.cache_dir, train_folders,   'train')
+    train_tag  = f'train_aug{args.augment_seed}' if args.augment else 'train'
+    train_cp   = emb_cache_path(args.cache_dir, train_folders,   train_tag)
     holdout_cp = emb_cache_path(args.cache_dir, holdout_folders, 'holdout')
     unann_cp   = emb_cache_path(args.cache_dir, train_folders,   'unann')
 
-    need_ann_beats   = (args.force
-                        or not (_emb_cache_exists(train_cp) and _emb_cache_exists(holdout_cp))
-                        or not (_ys_valid(train_cp) and _ys_valid(holdout_cp)))
-    need_unann_beats = args.force or not _unann_cache_exists(unann_cp)
+    print('Loading cache...')
+    embs,       decisions,       ys,    all_leads    = load_cache(train_cp)
+    ho_embs,    ho_decisions,    ho_ys, ho_all_leads = load_cache(holdout_cp)
+    unann_embs, unann_decisions                      = load_cache_unann(unann_cp)
+    print(f'  train={tuple(embs.shape)}  unann={tuple(unann_embs.shape)}  holdout={tuple(ho_embs.shape)}')
 
-    train_ann_ds = holdout_ds = train_unann_ds = None
-    if need_ann_beats or need_unann_beats:
-        print('Loading / processing beats...')
-        train_ann, train_unann, _ = load_or_process_beats(train_folders,   args.cache_dir, args.force)
-        holdout_ann, _, _         = load_or_process_beats(holdout_folders, args.cache_dir, args.force)
-        print(f'  train annotated={len(train_ann)}  unannotated={len(train_unann)}  '
-              f'holdout annotated={len(holdout_ann)}')
-        if need_ann_beats:
-            train_ann_ds = BeatDataset(train_ann,   transform=preprocess_hubert)
-            holdout_ds   = BeatDataset(holdout_ann, transform=preprocess_hubert)
-        if need_unann_beats:
-            train_unann_ds = BeatDataset(train_unann, transform=preprocess_hubert,
-                                         require_both=False)
-    else:
-        print('  [cache] all embeddings found — skipping beat load')
+    from model import MaskHead
+    from beat import WINDOW_PRE, WINDOW_POST
+    head = MaskHead(embed_dim=embs.shape[-1], window_size=WINDOW_PRE + WINDOW_POST,
+                    width=args.width).to(device)
+    print(head)
 
-    print('Building model (or loading head from cache)...')
-    model = load_or_build_model(
-        args.cache_dir, args.force, device, args.width,
-        train_folders, holdout_folders,
-        extra_caches=(unann_cp,),
-    )
-
-    print('Precomputing annotated embeddings (or loading from cache)...')
-    embs, decisions, ys, lead2 = load_or_precompute(
-        model, train_ann_ds, args.batch_size, device,
-        cache_path=train_cp, force=args.force, desc='  train  ',
-    )
-    ho_embs, ho_decisions, ho_ys, ho_lead2 = load_or_precompute(
-        model, holdout_ds, args.batch_size, device,
-        cache_path=holdout_cp, force=args.force, desc='  holdout',
-    )
-
-    print('Precomputing unannotated embeddings (or loading from cache)...')
-    unann_embs, unann_decisions = load_or_precompute_unann(
-        model, train_unann_ds, args.batch_size, device,
-        cache_path=unann_cp, force=args.force, desc='  unann  ',
-    )
-    print(f'  annotated train={tuple(embs.shape)}  '
-          f'unannotated={tuple(unann_embs.shape)}  '
-          f'holdout={tuple(ho_embs.shape)}')
-
-    # lead2 self-heal
-    if ho_lead2 is None:
-        ho_ann_raw, _, _ = load_or_process_beats(holdout_folders, args.cache_dir, force=False)
-        filtered = [b for b in ho_ann_raw
-                    if b.qrs_duration is not None and b.qt_interval is not None]
-        ho_lead2 = torch.from_numpy(
-            np.stack([b.window[2, :].astype(np.float32) for b in filtered])
-        )
-        np.save(f'{holdout_cp}_lead2.npy', ho_lead2.numpy())
-
-    full_ds = TensorDataset(embs, decisions, ys)
+    _al_tr = all_leads    if all_leads    is not None else torch.zeros(len(embs),    13, ys.shape[-1])
+    _al_ho = ho_all_leads if ho_all_leads is not None else torch.zeros(len(ho_embs), 13, ho_ys.shape[-1])
+    full_ds = TensorDataset(embs, decisions, ys, _al_tr)
     n_val   = max(1, int(len(full_ds) * args.val_split))
     n_train = len(full_ds) - n_val
     train_ds, val_ds = random_split(
         full_ds, [n_train, n_val],
         generator=torch.Generator().manual_seed(args.seed),
     )
-    holdout_full_ds = TensorDataset(ho_embs, ho_decisions, ho_ys)
+    holdout_full_ds = TensorDataset(ho_embs, ho_decisions, ho_ys, _al_ho)
     unann_full_ds   = TensorDataset(unann_embs, unann_decisions)
 
     print(f'Train / Val / Holdout ({holdout_pat}) / Unannotated : '
@@ -185,7 +163,7 @@ def main(args):
         DataLoader(unann_full_ds, batch_size=args.batch_size, shuffle=True, pin_memory=True)
     )
 
-    optimizer = torch.optim.AdamW(model.head.parameters(), lr=args.lr, weight_decay=args.wd)
+    optimizer = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.wd)
     warmup_epochs = max(1, args.epochs // 10)
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer,
@@ -213,19 +191,21 @@ def main(args):
 
     bar = tqdm(range(1, args.epochs + 1), desc='training', unit='ep')
     for epoch in bar:
-        tr_bce, tr_qrs, tr_qt = run_epoch(
-            model.head, train_dl, unann_iter, optimizer, device,
+        do_collect = args.plot_every > 0 and (epoch % args.plot_every == 0 or epoch == args.epochs)
+        tr_bce, tr_qrs, tr_qt, *tr_c = run_epoch(
+            head, train_dl, unann_iter, optimizer, device,
             train=True, scaler=scaler,
             lambda_tv_ann=args.lambda_tv_ann,
             lambda_tv_unann=args.lambda_tv_unann,
             lambda_dur=args.lambda_dur,
             ann_dur_mu=ann_dur_mu,
             dur_delta=args.dur_delta,
+            collect=do_collect,
         )
-        va_bce, va_qrs, va_qt = run_epoch(
-            model.head, val_dl, unann_iter, optimizer, device, train=False)
-        ho_bce, ho_qrs, ho_qt = run_epoch(
-            model.head, holdout_dl, unann_iter, optimizer, device, train=False)
+        va_bce, va_qrs, va_qt, *va_c = run_epoch(
+            head, val_dl, unann_iter, optimizer, device, train=False, collect=do_collect)
+        ho_bce, ho_qrs, ho_qt, *ho_c = run_epoch(
+            head, holdout_dl, unann_iter, optimizer, device, train=False, collect=do_collect)
         scheduler.step()
 
         best_val = min(best_val, va_qrs + va_qt)
@@ -244,21 +224,28 @@ def main(args):
             lr=f'{scheduler.get_last_lr()[0]:.2e}',
         )
 
-        if args.plot_every > 0 and (epoch % args.plot_every == 0 or epoch == args.epochs):
-            tr_idx = torch.tensor(train_ds.indices)
-            va_idx = torch.tensor(val_ds.indices)
+        if do_collect:
+            tr_col, va_col, ho_col = tr_c[0], va_c[0], ho_c[0]
             plot_data = {
-                'train':   collect_predictions(model.head, train_dl,   device),
-                'val':     collect_predictions(model.head, val_dl,     device),
-                'holdout': collect_predictions(model.head, holdout_dl, device),
+                'train':   (tr_col['preds'], tr_col['targets']),
+                'val':     (va_col['preds'], va_col['targets']),
+                'holdout': (ho_col['preds'], ho_col['targets']),
             }
-            sample_data, labels = build_sample_data(model.head, [
-                ('train',   embs[tr_idx], decisions[tr_idx], ys[tr_idx],
-                 lead2[tr_idx] if lead2 is not None else None),
-                ('val',     embs[va_idx], decisions[va_idx], ys[va_idx],
-                 lead2[va_idx] if lead2 is not None else None),
-                ('holdout', ho_embs, ho_decisions, ho_ys, ho_lead2),
-            ], device)
+            parts, labels = [], []
+            for name, col in [('train', tr_col), ('val', va_col), ('holdout', ho_col)]:
+                for tag, samp in [('best', col['best']), ('worst', col['worst'])]:
+                    e, d_s, y, l2 = samp
+                    parts.append(collect_sample_logits(head, e, d_s, y, l2, device))
+                    labels.append(f'{name} ({tag})')
+            keys = ['logits', 'mask', 'f_sig', 'g_sig', 'decision', 'y_mask']
+            sample_data = {k: np.concatenate([p[k] for p in parts], axis=0) for k in keys}
+            al_parts = [p['all_leads'] for p in parts]
+            sample_data['all_leads'] = (
+                np.concatenate(al_parts, axis=0)
+                if all(x is not None for x in al_parts) else None
+            )
+            if all_leads is None and ho_all_leads is None:
+                sample_data['all_leads'] = None
             sample_data['labels'] = labels
             dispatch_debug_plot(
                 epoch=epoch, history=history,
@@ -296,15 +283,17 @@ if __name__ == '__main__':
     parser.add_argument('--plots_dir',        default=None,
                         help='output folder for debug plots (default: <ckpt_dir>/debug)')
     parser.add_argument('--cache_dir',        default='cache')
-    parser.add_argument('--force',            action='store_true',
-                        help='recompute and overwrite all caches')
-    parser.add_argument('--lambda_tv_ann',    type=float, default=1.0,
+    parser.add_argument('--augment',          action='store_true',
+                        help='expand annotated training set 10x with scale+shift augmentation')
+    parser.add_argument('--augment_seed',     type=int, default=42,
+                        help='RNG seed for augmentation (also used as cache key)')
+    parser.add_argument('--lambda_tv_ann',    type=float, default=0.0,
                         help='TV weight on annotated batches')
-    parser.add_argument('--lambda_tv_unann',  type=float, default=0.5,
+    parser.add_argument('--lambda_tv_unann',  type=float, default=0.1,
                         help='TV weight on unannotated batches (continuity constraint)')
-    parser.add_argument('--lambda_dur',       type=float, default=0.0,
+    parser.add_argument('--lambda_dur',       type=float, default=0.01,
                         help='weight for duration prior loss on unannotated beats')
-    parser.add_argument('--dur_delta',        type=float, default=100.0,
+    parser.add_argument('--dur_delta',        type=float, default=70.0,
                         help='dead-zone half-width in ms (no penalty within ±dur_delta of annotated mean)')
     args = parser.parse_args()
     main(args)

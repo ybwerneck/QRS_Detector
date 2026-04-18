@@ -23,20 +23,21 @@ class MaskHead(nn.Module):
     Architecture
     ------------
     g path  — COMPRESSOR
-      (N, 12, t, D) permute→ (N, D, 12, t)
+      (N, L, t, D) permute→ (N, D, L, t)
       Conv2d bottleneck + depthwise lead-collapse → (N, 1, 1, t)
-      squeeze + upsample → (N, 1, window_size)   coarse prior g
+      squeeze + upsample → (N, 1, window_size)   coarse prior g  (interpretable)
 
-    f path  — POINTWISE MLP on PT decision signal
-      (N, window_size) → (N, 1, window_size)     refined prior f
+    f path  — PT energy signal, all leads
+      (N, n_pt_leads, window_size) → Conv1d(n_pt_leads, 1, 1) learned lead mix
+      → (N, 1, window_size)  refined prior f  (interpretable)
 
     FUSION
-      cat[sigmoid(f), sigmoid(g)] → (N, 2, window_size)
-      Conv1d × 3 → (N, 2, window_size) logits   (2 channels: QRS, QT)
+      cat[g, f] → (N, 2, window_size)
+      Conv1d dilated stack → (N, 1, window_size) logits
       sigmoid → mask
     """
 
-    def __init__(self, embed_dim=768, window_size=None, width=128, monotone_fusion=False):
+    def __init__(self, embed_dim=768, window_size=None, width=128, n_pt_leads=12):
         # width is accepted for API compatibility but unused
         super().__init__()
         if window_size is None:
@@ -49,38 +50,34 @@ class MaskHead(nn.Module):
         self.compress = nn.Sequential(
             nn.Conv2d(embed_dim, 1024, kernel_size=1),
             nn.BatchNorm2d(1024),
-            nn.GELU(),                                                            # (N, 1024, 12, t)
+            nn.GELU(),                                                            # (N, 1024, L, t)
 
-            nn.Conv2d(1024, 512, kernel_size=1), nn.GELU(),                        # (N, 512, 12, t)
+            nn.Conv2d(1024, 512, kernel_size=1), nn.GELU(),                        # (N, 512, L, t)
 
-            nn.Conv2d(512, 128, kernel_size=(1, 7), padding=(0, 3), groups=128), nn.GELU(),  # (N, 128, 12, t)
-            nn.Conv2d(128, 64,  kernel_size=(1, 7), padding=(0, 3), groups=64),  nn.GELU(),  # (N, 64,  12, t)
-            nn.Conv2d(64,  32,  kernel_size=(1, 7), padding=(0, 3), groups=32),  nn.GELU(),  # (N, 32,  12, t)
-            nn.Conv2d(32,  16,  kernel_size=(1, 7), padding=(0, 3), groups=16),  nn.GELU(),  # (N, 16,  12, t)
+            nn.Conv2d(512, 128, kernel_size=(1, 7), padding=(0, 3), groups=128), nn.GELU(),  # (N, 128, L, t)
+            nn.Conv2d(128, 64,  kernel_size=(1, 7), padding=(0, 3), groups=64),  nn.GELU(),  # (N, 64,  L, t)
+            nn.Conv2d(64,  32,  kernel_size=(1, 7), padding=(0, 3), groups=32),  nn.GELU(),  # (N, 32,  L, t)
+            nn.Conv2d(32,  16,  kernel_size=(1, 7), padding=(0, 3), groups=16),  nn.GELU(),  # (N, 16,  L, t)
 
-            # learned lead collapse at the end
+            # learned lead collapse + temporal smoothing → single prior per beat
             nn.Conv2d(16,   1,  kernel_size=(12, 7), padding=(0, 3)),                         # (N,  1,  1, t)
         )
-        # ── f path: pointwise MLP on PT signal ───────────────────────
-        self.pt_mlp = nn.Sequential(
-            nn.Conv1d(1, 128, kernel_size=1), nn.GELU(),
 
-            nn.Conv1d(128, 1, kernel_size=1),                # (N, 1, 550)
-        )
+        # ── f path: per-lead scale + bias, all positive (24 params) ──
+        # output = sum_i( w_i * d_i + b_i ), guaranteed monotone in every lead
+        self.pt_lead_w = nn.Parameter(torch.ones(n_pt_leads))   # (12,)
+        self.pt_lead_b = nn.Parameter(torch.zeros(n_pt_leads))  # (12,)
+        nn.utils.parametrize.register_parametrization(self, 'pt_lead_w', _Positive())
+        nn.utils.parametrize.register_parametrization(self, 'pt_lead_b', _Positive())
 
-        # ── fusion ────────────────────────────────────────────────────
+        # ── fusion (dilated stack, receptive field ≈ 2*kernel*(1+2+4+8)=210ms) ──
         self.fusion = nn.Sequential(
-            nn.Conv1d(2, 128, kernel_size=7, padding=3), nn.GELU(),
-            nn.Conv1d(128, 256, kernel_size=7, padding=3), nn.GELU(),
-            nn.Conv1d(256, 128, kernel_size=7, padding=3), nn.GELU(),
-            nn.Conv1d(128, 64, kernel_size=7, padding=3), nn.GELU(),
-            nn.Conv1d(64, 1, kernel_size=1),                 # (N, 1, 550) logits — QRS only
+            nn.Conv1d(2,   128, kernel_size=7, padding=3,  dilation=1), nn.GELU(),
+            nn.Conv1d(128, 256, kernel_size=7, padding=6,  dilation=2), nn.GELU(),
+            nn.Conv1d(256, 128, kernel_size=7, padding=12, dilation=4), nn.GELU(),
+            nn.Conv1d(128, 64,  kernel_size=7, padding=24, dilation=8), nn.GELU(),
+            nn.Conv1d(64,  1,   kernel_size=1),                          # (N, 1, 550) logits
         )
-        if monotone_fusion:
-            for m in self.fusion.modules():
-                if isinstance(m, nn.Conv1d):
-                    nn.utils.parametrize.register_parametrization(m, 'weight', _Positive())
-
         # ablation flags
         self.ablate_embedding = False
         self.ablate_decision  = False
@@ -89,46 +86,38 @@ class MaskHead(nn.Module):
         # x: (N, L, t, D) — e.g. (N, 12, 96, 768)
         N, L, t, D = x.shape
 
-        # ── g: compressor ─────────────────────────────────────────────
-        g = x.permute(0, 3, 1, 2)          # (N, D, L, t) = (N, 768, 12, 96)
+        # ── g: compressor → scalar prior ──────────────────────────────
+        g = x.permute(0, 3, 1, 2)          # (N, D, L, t)
         if self.ablate_embedding:
             g = torch.zeros_like(g)
-        t_weights = torch.softmax(self.time_attn, dim=0)  # (t,)
-        g = g * t_weights.view(1, 1, 1, -1)               # (N, D, L, t)
+        t_weights = torch.softmax(self.time_attn, dim=0)
+        g = g * t_weights.view(1, 1, 1, -1)
         g = self.compress(g)                # (N, 1, 1, t)
         g = g.squeeze(2)                    # (N, 1, t)
         g = F.interpolate(g, size=self.window_size,
-        mode='linear', align_corners=False)  # (N, 1, 550)
-
-
-
-
-
-        # ── f: PT signal ──────────────────────────────────────────────
-        d = decision.unsqueeze(1)           # (N, 1, 550)
-        if self.ablate_decision:
-            d = torch.zeros_like(d)
-        
-        f = d#self.pt_mlp(d)                  # (N, 1, 550)
-
-
-
-
-
-        mu  = d.mean(dim=-1, keepdim=True)
-        std = d.std(dim=-1, keepdim=True).clamp(min=1e-6)
-        f = (d - mu) / std   
-        
+                          mode='linear', align_corners=False)  # (N, 1, W)
         mu  = g.mean(dim=-1, keepdim=True)
         std = g.std(dim=-1, keepdim=True).clamp(min=1e-6)
-        g = (g -mu) / std   
-        
+        g = (g - mu) / std                  # (N, 1, W)
 
-        
-        logits =self.fusion(torch.cat([g, f], dim=1))  # (N, 1, 550)
-        
-        
-        
+        # ── f: learned lead-mix of PT energy → scalar prior ───────────
+        d = decision                        # (N, n_pt_leads, W)
+        if self.ablate_decision:
+            d = torch.zeros_like(d)
+
+
+
+
+
+
+        w = self.pt_lead_w.view(1, -1, 1)  # (1, 12, 1)
+        b = self.pt_lead_b.view(1, -1, 1)  # (1, 12, 1)
+        f = (w * d + b).sum(dim=1, keepdim=True)  # (N, 1, W)
+        mu  = f.mean(dim=-1, keepdim=True)
+        std = f.std(dim=-1, keepdim=True).clamp(min=1e-6)
+        f = (f - mu) / std                  # (N, 1, W)
+
+        logits = self.fusion(torch.cat([g, f], dim=1))  # (N, 1, W)
         mask   = torch.sigmoid(logits)
 
         return logits, mask, mask.sum(dim=-1), f, g

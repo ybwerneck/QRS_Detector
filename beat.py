@@ -9,6 +9,7 @@ WINDOW_POST  = 400    # samples after spike  (QRS + ST + T-wave)
 
 CONTEXT_PRE  = 2500   # samples before spike for encoder context (2.5 s at 1 kHz)
 CONTEXT_POST = 2500   # samples after  spike for encoder context (2.5 s at 1 kHz)
+CONTEXT_SHIFT_MAX = 500  # max shift for augmentation (samples at FS = ms)
 
 _ANNOTATION_SECTIONS = {
     'Period Data', 'QRS Data', 'QT Data',
@@ -44,6 +45,8 @@ class Beat:
         self.context_window   = None          # (n_leads, CONTEXT_PRE+CONTEXT_POST) — 5 s centred on spike
         self.spike_in_context = CONTEXT_PRE   # sample index of spike inside context_window (at FS)
         self.decision_window  = None          # (WINDOW_PRE+WINDOW_POST,) Pan-Tompkins integrated signal
+        self.context_buffer   = None          # (n_leads, CONTEXT_PRE+CONTEXT_POST+2*CONTEXT_SHIFT_MAX) — wider slice for shift augmentation
+        self.pt_buffer        = None          # (WINDOW_PRE+WINDOW_POST+2*CONTEXT_SHIFT_MAX,) — wider PT slice
 
     def annotate(self, label=None, period=None,
                  qrs_duration=None, qrs_start=None,
@@ -149,29 +152,33 @@ def recover_noisy_beats(beats, signal_matrix):
     return beats
 
 
+def _extract_slice(signal_matrix, center, pre, post):
+    """Extract a (n_leads, pre+post) slice centred at `center`, zero-padding edges."""
+    n_leads, n_samples = signal_matrix.shape
+    size     = pre + post
+    lo       = center - pre
+    hi       = center + post
+    pad_left  = max(0, -lo)
+    lo_clamp  = max(0, lo)
+    hi_clamp  = min(n_samples, hi)
+    out = np.zeros((n_leads, size), dtype=signal_matrix.dtype)
+    out[:, pad_left: pad_left + (hi_clamp - lo_clamp)] = signal_matrix[:, lo_clamp:hi_clamp]
+    return out
+
+
 def extract_context_windows(signal_matrix, beats):
     """Attach a 5-second encoder context window to each beat, centred on its spike.
 
-    The context spans [spike - CONTEXT_PRE, spike + CONTEXT_POST) at FS.
-    Regions outside the signal are zero-padded so the shape is always constant.
-    beat.spike_in_context records where the spike falls inside the context (at FS).
+    Also stores context_buffer — a wider slice (±CONTEXT_SHIFT_MAX extra) for
+    shift augmentation.  beat.spike_in_context records where the spike falls
+    inside context_window (at FS).
     """
-    n_leads, n_samples = signal_matrix.shape
-    context_size = CONTEXT_PRE + CONTEXT_POST
-
     for beat in beats:
-        lo = beat.spike_idx - CONTEXT_PRE
-        hi = beat.spike_idx + CONTEXT_POST
-
-        pad_left  = max(0, -lo)
-        pad_right = max(0, hi - n_samples)
-        lo_clamp  = max(0, lo)
-        hi_clamp  = min(n_samples, hi)
-
-        ctx = np.zeros((n_leads, context_size), dtype=signal_matrix.dtype)
-        ctx[:, pad_left: pad_left + (hi_clamp - lo_clamp)] = signal_matrix[:, lo_clamp:hi_clamp]
-
-        beat.context_window   = ctx
+        beat.context_window   = _extract_slice(signal_matrix, beat.spike_idx,
+                                               CONTEXT_PRE, CONTEXT_POST)
+        beat.context_buffer   = _extract_slice(signal_matrix, beat.spike_idx,
+                                               CONTEXT_PRE  + CONTEXT_SHIFT_MAX,
+                                               CONTEXT_POST + CONTEXT_SHIFT_MAX)
         beat.spike_in_context = CONTEXT_PRE  # always centred; pad shifts signal, not spike
 
     return beats
@@ -463,26 +470,45 @@ def annotate_beats(beats, annotations, tol_ms=150.0):
 # 6. FULL PIPELINE
 # =========================================================
 
-def extract_decision_windows(leads, beats):
+# Standard 12-lead ECG leads used for PT energy (excludes 'VD d' stimulus electrode)
+PT_LEADS = ['I', 'II', 'III', 'AVR', 'AVL', 'AVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6']
+PT_N_LEADS = len(PT_LEADS)  # 12
+
+
+def extract_decision_windows(leads, lead_names, beats):
     """Attach the Pan-Tompkins integrated signal window to each beat.
 
     The window spans [spike_idx - WINDOW_PRE, spike_idx + WINDOW_POST), matching
     the shape of beat.window.  Regions outside the signal are zero-padded.
-    Values are in the same [0, 120] range as the detection variable.
+    Also stores pt_buffer — a wider slice (±CONTEXT_SHIFT_MAX extra) for
+    shift augmentation.
+
+    decision_window : (PT_N_LEADS, win_size)   — PT energy per standard lead
+    pt_buffer       : (PT_N_LEADS, buf_size)   — wider slice for shift augmentation
     """
-    sig = leads['II']
-    _, integrated, _, _, _ = _pan_tompkins_core(sig, FS)
-    n        = len(integrated)
+    pt_names = [n for n in PT_LEADS if n in leads]
+    integrated_signals = []
+    for name in pt_names:
+        _, integ, _, _, _ = _pan_tompkins_core(leads[name], FS)
+        integrated_signals.append(integ)
+    n_leads  = len(integrated_signals)
+    n        = len(integrated_signals[0])
     win_size = WINDOW_PRE + WINDOW_POST
+    buf_size = win_size + 2 * CONTEXT_SHIFT_MAX
 
     for beat in beats:
-        lo   = beat.spike_idx - WINDOW_PRE
-        hi   = beat.spike_idx + WINDOW_POST
-        lo_c = max(0, lo)
-        hi_c = min(n, hi)
-        w    = np.zeros(win_size, dtype=np.float32)
-        w[lo_c - lo : hi_c - lo] = integrated[lo_c : hi_c]
-        beat.decision_window = w
+        for pre, post, size, attr in [
+            (WINDOW_PRE,                     WINDOW_POST,                     win_size, 'decision_window'),
+            (WINDOW_PRE + CONTEXT_SHIFT_MAX, WINDOW_POST + CONTEXT_SHIFT_MAX, buf_size, 'pt_buffer'),
+        ]:
+            lo   = beat.spike_idx - pre
+            hi   = beat.spike_idx + post
+            lo_c = max(0, lo)
+            hi_c = min(n, hi)
+            w    = np.zeros((n_leads, size), dtype=np.float32)
+            for li, integrated in enumerate(integrated_signals):
+                w[li, lo_c - lo : hi_c - lo] = integrated[lo_c : hi_c]
+            setattr(beat, attr, w)
 
     return beats
 
@@ -502,7 +528,7 @@ def process_study(filepath):
     beats              = extract_windows(matrix, spikes)
     annotate_beats(beats, annotations)
     extract_context_windows(matrix, beats)
-    extract_decision_windows(leads, beats)
+    extract_decision_windows(leads, lead_names, beats)
     for beat in beats:
         beat.source = filepath
     return beats, lead_names, leads
@@ -512,27 +538,134 @@ def process_study(filepath):
 # 7. DATASET UTILITIES
 # =========================================================
 
+_BEAT_CACHE_VERSION = 3   # bump when Beat fields or save format change
+_FLOAT_FIELDS = ('period', 'qrs_duration', 'qrs_start', 'qt_interval', 'qt_start')
+
+
+def _beats_npy_dir(cache_dir, key):
+    return os.path.join(cache_dir, f'beats_{key}')
+
+
+def _save_beats_npy(result, npy_dir):
+    """Serialize (annotated, unannotated, noisy) as stacked npy files."""
+    import json
+    os.makedirs(npy_dir, exist_ok=True)
+
+    for split, beats in zip(('ann', 'unann', 'noisy'), result):
+        N = len(beats)
+        np.save(os.path.join(npy_dir, f'{split}_n.npy'), np.array([N], dtype=np.int32))
+        if N == 0:
+            continue
+
+        np.save(os.path.join(npy_dir, f'{split}_window.npy'),
+                np.stack([b.window for b in beats]).astype(np.float32))
+        np.save(os.path.join(npy_dir, f'{split}_spike_idx.npy'),
+                np.array([b.spike_idx  for b in beats], dtype=np.int32))
+        np.save(os.path.join(npy_dir, f'{split}_window_pre.npy'),
+                np.array([b.window_pre for b in beats], dtype=np.int32))
+        np.save(os.path.join(npy_dir, f'{split}_label.npy'),
+                np.array([b.label if b.label is not None else -1
+                          for b in beats], dtype=np.int16))
+        np.save(os.path.join(npy_dir, f'{split}_noisy.npy'),
+                np.array([b.noisy for b in beats], dtype=bool))
+        for field in _FLOAT_FIELDS:
+            np.save(os.path.join(npy_dir, f'{split}_{field}.npy'),
+                    np.array([getattr(b, field) if getattr(b, field) is not None else np.nan
+                              for b in beats], dtype=np.float32))
+        with open(os.path.join(npy_dir, f'{split}_source.json'), 'w') as fh:
+            json.dump([b.source for b in beats], fh)
+
+        if getattr(beats[0], 'context_window', None) is not None:
+            np.save(os.path.join(npy_dir, f'{split}_context_window.npy'),
+                    np.stack([b.context_window  for b in beats]).astype(np.float32))
+            np.save(os.path.join(npy_dir, f'{split}_context_buffer.npy'),
+                    np.stack([b.context_buffer  for b in beats]).astype(np.float32))
+            np.save(os.path.join(npy_dir, f'{split}_decision_window.npy'),
+                    np.stack([b.decision_window for b in beats]).astype(np.float32))
+            np.save(os.path.join(npy_dir, f'{split}_pt_buffer.npy'),
+                    np.stack([b.pt_buffer       for b in beats]).astype(np.float32))
+
+    np.save(os.path.join(npy_dir, 'version.npy'),
+            np.array([_BEAT_CACHE_VERSION], dtype=np.int32))
+
+
+def _load_beats_npy(npy_dir):
+    """Deserialize (annotated, unannotated, noisy) from stacked npy files.
+
+    All arrays are read fully into RAM upfront (no mmap).
+    """
+    import json
+    result = []
+    for split in ('ann', 'unann', 'noisy'):
+        N = int(np.load(os.path.join(npy_dir, f'{split}_n.npy'))[0])
+        if N == 0:
+            result.append([])
+            continue
+
+        window      = np.load(os.path.join(npy_dir, f'{split}_window.npy'))
+        spike_idx   = np.load(os.path.join(npy_dir, f'{split}_spike_idx.npy'))
+        window_pre  = np.load(os.path.join(npy_dir, f'{split}_window_pre.npy'))
+        label       = np.load(os.path.join(npy_dir, f'{split}_label.npy'))
+        noisy_arr   = np.load(os.path.join(npy_dir, f'{split}_noisy.npy'))
+        float_arrs  = {f: np.load(os.path.join(npy_dir, f'{split}_{f}.npy'))
+                       for f in _FLOAT_FIELDS}
+        with open(os.path.join(npy_dir, f'{split}_source.json')) as fh:
+            sources = json.load(fh)
+
+        ctx_path = os.path.join(npy_dir, f'{split}_context_window.npy')
+        if os.path.exists(ctx_path):
+            context_window  = np.load(ctx_path)
+            context_buffer  = np.load(os.path.join(npy_dir, f'{split}_context_buffer.npy'))
+            decision_window = np.load(os.path.join(npy_dir, f'{split}_decision_window.npy'))
+            pt_buffer       = np.load(os.path.join(npy_dir, f'{split}_pt_buffer.npy'))
+        else:
+            context_window = context_buffer = decision_window = pt_buffer = None
+
+        beats = []
+        for i in range(N):
+            beat            = Beat(int(spike_idx[i]), window[i])
+            beat.window_pre = int(window_pre[i])
+            beat.label      = None if label[i] == -1 else int(label[i])
+            beat.noisy      = bool(noisy_arr[i])
+            beat.source     = sources[i]
+            for field, arr in float_arrs.items():
+                v = float(arr[i])
+                setattr(beat, field, None if np.isnan(v) else v)
+            if context_window is not None:
+                beat.context_window  = context_window[i]
+                beat.context_buffer  = context_buffer[i]
+                beat.decision_window = decision_window[i]
+                beat.pt_buffer       = pt_buffer[i]
+            beats.append(beat)
+
+        result.append(beats)
+    return tuple(result)
+
+
 def load_or_process_beats(folders, cache_dir='cache', force=False,
                           ecg_filename='ecg_data.txt'):
-    """Return (annotated, unannotated, noisy), loading from pickle cache when available.
+    """Return (annotated, unannotated, noisy), loading from npy cache when available.
 
-    Cache key: sorted folder basenames, so different patient sets produce
-    different files.  Use force=True to reprocess and overwrite.
+    Cache key: sorted folder basenames.  Use force=True to reprocess and overwrite.
+    All arrays are loaded fully into RAM on read (no lazy mmap).
     """
-    import pickle
-    key        = '_'.join(sorted(os.path.basename(f) for f in folders))
-    cache_path = os.path.join(cache_dir, f'beats_{key}.pkl')
+    key     = '_'.join(sorted(os.path.basename(f) for f in folders))
+    npy_dir = _beats_npy_dir(cache_dir, key)
+    ver_path = os.path.join(npy_dir, 'version.npy')
 
-    if not force and os.path.exists(cache_path):
-        print(f'  [cache] loading beats from {cache_path}')
-        with open(cache_path, 'rb') as fh:
-            return pickle.load(fh)
+    cache_ok = (not force
+                and os.path.isdir(npy_dir)
+                and os.path.exists(ver_path)
+                and int(np.load(ver_path)[0]) == _BEAT_CACHE_VERSION)
+
+    if cache_ok:
+        print(f'  [cache] loading beats from {npy_dir}/')
+        return _load_beats_npy(npy_dir)
 
     result = load_patient_beats(folders, ecg_filename)
     os.makedirs(cache_dir, exist_ok=True)
-    with open(cache_path, 'wb') as fh:
-        pickle.dump(result, fh, protocol=5)   # protocol 5: zero-copy for numpy buffers
-    print(f'  [cache] saved beats to  {cache_path}')
+    _save_beats_npy(result, npy_dir)
+    print(f'  [cache] saved beats to  {npy_dir}/')
     return result
 
 
@@ -689,7 +822,7 @@ if __name__ == "__main__":
 
     sig_i = leads['I']
     decision, thr = pan_tompkins_signal(leads)
-    plot_signal_windows(sig_i, _beats_plot, t_start=276229-1000, t_end=276229+1000,
+    plot_signal_windows(sig_i, _beats_plot, t_start=25000-1000, t_end=25000+1000,
                         decision=decision, threshold=thr)
     plt.savefig("signal_windows.png", dpi=300, bbox_inches="tight")
     print("Saved signal_windows.png")

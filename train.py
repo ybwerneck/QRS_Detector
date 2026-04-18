@@ -24,13 +24,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from tqdm import tqdm
 
-from beat import load_or_process_beats
-from dataset import BeatDataset, preprocess_hubert
 from train_utils import (
     dispatch_debug_plot,
-    emb_cache_path, _emb_cache_exists, _ys_valid,
-    load_or_build_model, load_or_precompute,
-    collect_predictions, build_sample_data,
+    emb_cache_path, load_cache,
+    collect_sample_logits,
     tv_loss,
 )
 
@@ -39,12 +36,17 @@ from train_utils import (
 # Train / eval
 # =========================================================
 
-def run_epoch(head, loader, optimizer, device, train=True, scaler=None, lambda_tv=1.0):
+def run_epoch(head, loader, optimizer, device, train=True, scaler=None, lambda_tv=1.0, collect=False):
     head.train(train)
     total_bce = total_qrs = n = 0
 
+    if collect:
+        all_preds, all_targets = [], []
+        best_err, worst_err = float('inf'), float('-inf')
+        best_sample = worst_sample = None
+
     with torch.set_grad_enabled(train):
-        for emb, d, y_mask in loader:
+        for emb, d, y_mask, l2 in loader:
             emb    = emb.to(device, non_blocking=True)
             d      = d.to(device, non_blocking=True)
             y_mask = y_mask.to(device, non_blocking=True)
@@ -75,12 +77,30 @@ def run_epoch(head, loader, optimizer, device, train=True, scaler=None, lambda_t
                 hard_dur = (mask > 0.5).float().sum(dim=-1)
                 qrs_mae  = (hard_dur[:, 0] - true_dur[:, 0]).abs().mean().item()
 
+            if collect:
+                pad = torch.zeros_like(hard_dur)
+                all_preds.append(torch.cat([hard_dur, pad], dim=-1).cpu().numpy())
+                all_targets.append(true_dur.cpu().numpy())
+                errs = (hard_dur[:, 0] - true_dur[:, 0]).abs()
+                bi = errs.argmin().item()
+                wi = errs.argmax().item()
+                if errs[bi].item() < best_err:
+                    best_err = errs[bi].item()
+                    best_sample = (emb[[bi]].cpu(), d[[bi]].cpu(), y_mask[[bi]].cpu(), l2[[bi]])
+                if errs[wi].item() > worst_err:
+                    worst_err = errs[wi].item()
+                    worst_sample = (emb[[wi]].cpu(), d[[wi]].cpu(), y_mask[[wi]].cpu(), l2[[wi]])
+
             B = emb.size(0)
             total_bce += loss.item() * B
             total_qrs += qrs_mae     * B
             n         += B
 
-    return total_bce / n, total_qrs / n, 0.0
+    metrics = total_bce / n, total_qrs / n, 0.0
+    if not collect:
+        return metrics
+    return metrics + ({'preds': np.concatenate(all_preds), 'targets': np.concatenate(all_targets),
+                       'best': best_sample, 'worst': worst_sample},)
 
 
 # =========================================================
@@ -101,66 +121,38 @@ def main(args):
     print(f'Train folders   : {[os.path.basename(f) for f in train_folders]}')
     print(f'Holdout folders : {[os.path.basename(f) for f in holdout_folders]}')
 
-    train_cp   = emb_cache_path(args.cache_dir, train_folders,   'train')
+    train_tag  = f'train_aug{args.augment_seed}' if args.augment else 'train'
+    train_cp   = emb_cache_path(args.cache_dir, train_folders,   train_tag)
     holdout_cp = emb_cache_path(args.cache_dir, holdout_folders, 'holdout')
-    need_beats = (args.force
-                  or not (_emb_cache_exists(train_cp) and _emb_cache_exists(holdout_cp))
-                  or not (_ys_valid(train_cp) and _ys_valid(holdout_cp)))
 
-    if need_beats:
-        print('Loading / processing beats...')
-        train_ann, _, _   = load_or_process_beats(train_folders,   args.cache_dir, args.force)
-        holdout_ann, _, _ = load_or_process_beats(holdout_folders, args.cache_dir, args.force)
-        print(f'  train annotated={len(train_ann)}  holdout annotated={len(holdout_ann)}')
-        train_ds_full = BeatDataset(train_ann,   transform=preprocess_hubert)
-        holdout_ds    = BeatDataset(holdout_ann, transform=preprocess_hubert)
-    else:
-        print('  [cache] embeddings found — skipping beat load')
-        train_ds_full = holdout_ds = None
-
-    print('Building model (or loading head from cache)...')
-    model = load_or_build_model(
-        args.cache_dir, args.force, device, args.width,
-        train_folders, holdout_folders,
-    )
-
-    print('Precomputing embeddings (or loading from cache)...')
-    embs, decisions, ys, lead2 = load_or_precompute(
-        model, train_ds_full, args.batch_size, device,
-        cache_path=train_cp, force=args.force, desc='  train  ',
-    )
-    ho_embs, ho_decisions, ho_ys, ho_lead2 = load_or_precompute(
-        model, holdout_ds, args.batch_size, device,
-        cache_path=holdout_cp, force=args.force, desc='  holdout',
-    )
+    print('Loading cache...')
+    embs,    decisions,    ys,    all_leads    = load_cache(train_cp)
+    ho_embs, ho_decisions, ho_ys, ho_all_leads = load_cache(holdout_cp)
     print(f'  train={tuple(embs.shape)}  holdout={tuple(ho_embs.shape)}')
 
-    # lead2 self-heal: rebuild from beats pickle if cache predates lead2 support
-    if ho_lead2 is None:
-        print('  [cache] lead2 missing — rebuilding from beats cache...')
-        ho_ann_raw, _, _ = load_or_process_beats(holdout_folders, args.cache_dir, force=False)
-        filtered = [b for b in ho_ann_raw
-                    if b.qrs_duration is not None and b.qt_interval is not None]
-        ho_lead2 = torch.from_numpy(
-            np.stack([b.window[2, :].astype(np.float32) for b in filtered])
-        )
-        np.save(f'{holdout_cp}_lead2.npy', ho_lead2.numpy())
+    from model import MaskHead
+    from beat import WINDOW_PRE, WINDOW_POST
+    head = MaskHead(embed_dim=embs.shape[-1], window_size=WINDOW_PRE + WINDOW_POST,
+                    width=args.width).to(device)
+    print(head)
 
-    full_ds = TensorDataset(embs, decisions, ys)
+    _al_tr = all_leads    if all_leads    is not None else torch.zeros(len(embs),    13, ys.shape[-1])
+    _al_ho = ho_all_leads if ho_all_leads is not None else torch.zeros(len(ho_embs), 13, ho_ys.shape[-1])
+    full_ds = TensorDataset(embs, decisions, ys, _al_tr)
     n_val   = max(1, int(len(full_ds) * args.val_split))
     n_train = len(full_ds) - n_val
     train_ds, val_ds = random_split(
         full_ds, [n_train, n_val],
         generator=torch.Generator().manual_seed(args.seed),
     )
-    holdout_full_ds = TensorDataset(ho_embs, ho_decisions, ho_ys)
+    holdout_full_ds = TensorDataset(ho_embs, ho_decisions, ho_ys, _al_ho)
     print(f'Train / Val / Holdout ({holdout_pat}) : {n_train} / {n_val} / {len(holdout_full_ds)}')
 
     train_dl   = DataLoader(train_ds,        batch_size=args.batch_size, shuffle=True,  pin_memory=True)
     val_dl     = DataLoader(val_ds,          batch_size=args.batch_size, shuffle=False, pin_memory=True)
     holdout_dl = DataLoader(holdout_full_ds, batch_size=args.batch_size, shuffle=False, pin_memory=True)
 
-    optimizer = torch.optim.AdamW(model.head.parameters(), lr=args.lr, weight_decay=args.wd)
+    optimizer = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.wd)
     warmup_epochs = max(1, args.epochs // 10)
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer,
@@ -188,9 +180,10 @@ def main(args):
 
     bar = tqdm(range(1, args.epochs + 1), desc='training', unit='ep')
     for epoch in bar:
-        tr_bce, tr_qrs, tr_qt = run_epoch(model.head, train_dl,   optimizer, device, train=True,  scaler=scaler)
-        va_bce, va_qrs, va_qt = run_epoch(model.head, val_dl,     optimizer, device, train=False)
-        ho_bce, ho_qrs, ho_qt = run_epoch(model.head, holdout_dl, optimizer, device, train=False)
+        do_collect = args.plot_every > 0 and (epoch % args.plot_every == 0 or epoch == args.epochs)
+        tr_bce, tr_qrs, tr_qt, *tr_c = run_epoch(head, train_dl,   optimizer, device, train=True,  scaler=scaler, collect=do_collect)
+        va_bce, va_qrs, va_qt, *va_c = run_epoch(head, val_dl,     optimizer, device, train=False, collect=do_collect)
+        ho_bce, ho_qrs, ho_qt, *ho_c = run_epoch(head, holdout_dl, optimizer, device, train=False, collect=do_collect)
         scheduler.step()
 
         best_val = min(best_val, va_qrs + va_qt)
@@ -209,21 +202,28 @@ def main(args):
             lr=f'{scheduler.get_last_lr()[0]:.2e}',
         )
 
-        if args.plot_every > 0 and (epoch % args.plot_every == 0 or epoch == args.epochs):
-            tr_idx = torch.tensor(train_ds.indices)
-            va_idx = torch.tensor(val_ds.indices)
+        if do_collect:
+            tr_col, va_col, ho_col = tr_c[0], va_c[0], ho_c[0]
             plot_data = {
-                'train':   collect_predictions(model.head, train_dl,   device),
-                'val':     collect_predictions(model.head, val_dl,     device),
-                'holdout': collect_predictions(model.head, holdout_dl, device),
+                'train':   (tr_col['preds'], tr_col['targets']),
+                'val':     (va_col['preds'], va_col['targets']),
+                'holdout': (ho_col['preds'], ho_col['targets']),
             }
-            sample_data, labels = build_sample_data(model.head, [
-                ('train',   embs[tr_idx], decisions[tr_idx], ys[tr_idx],
-                 lead2[tr_idx] if lead2 is not None else None),
-                ('val',     embs[va_idx], decisions[va_idx], ys[va_idx],
-                 lead2[va_idx] if lead2 is not None else None),
-                ('holdout', ho_embs, ho_decisions, ho_ys, ho_lead2),
-            ], device)
+            parts, labels = [], []
+            for name, col in [('train', tr_col), ('val', va_col), ('holdout', ho_col)]:
+                for tag, samp in [('best', col['best']), ('worst', col['worst'])]:
+                    e, d_s, y, l2 = samp
+                    parts.append(collect_sample_logits(head, e, d_s, y, l2, device))
+                    labels.append(f'{name} ({tag})')
+            keys = ['logits', 'mask', 'f_sig', 'g_sig', 'decision', 'y_mask']
+            sample_data = {k: np.concatenate([p[k] for p in parts], axis=0) for k in keys}
+            al_parts = [p['all_leads'] for p in parts]
+            sample_data['all_leads'] = (
+                np.concatenate(al_parts, axis=0)
+                if all(x is not None for x in al_parts) else None
+            )
+            if all_leads is None and ho_all_leads is None:
+                sample_data['all_leads'] = None
             sample_data['labels'] = labels
             dispatch_debug_plot(
                 epoch=epoch, history=history,
@@ -261,7 +261,9 @@ if __name__ == '__main__':
     parser.add_argument('--plots_dir',       default=None,
                         help='output folder for debug plots (default: <ckpt_dir>/debug)')
     parser.add_argument('--cache_dir',       default='cache')
-    parser.add_argument('--force',           action='store_true',
-                        help='recompute and overwrite all caches')
+    parser.add_argument('--augment',         action='store_true',
+                        help='expand training set 10x with scale+shift augmentation')
+    parser.add_argument('--augment_seed',    type=int, default=42,
+                        help='RNG seed for augmentation (also used as cache key)')
     args = parser.parse_args()
     main(args)
