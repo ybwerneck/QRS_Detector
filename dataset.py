@@ -300,12 +300,12 @@ if __name__ == '__main__':
         b = copy.copy(src_beat)
         win_size     = WINDOW_PRE + WINDOW_POST
         context_size = CONTEXT_PRE + CONTEXT_POST
-        b.context_window  = src_beat.context_buffer[:, CONTEXT_SHIFT_MAX + s:
-                                                        CONTEXT_SHIFT_MAX + s + context_size]
-        b.decision_window = src_beat.pt_buffer[:,     CONTEXT_SHIFT_MAX + s:
+        ctx_lo = CONTEXT_SHIFT_MAX + s
+        win_lo = CONTEXT_PRE + CONTEXT_SHIFT_MAX - WINDOW_PRE + s  # spike at WINDOW_PRE in slice
+        b.context_window  = src_beat.context_buffer[:, ctx_lo : ctx_lo + context_size]
+        b.decision_window = src_beat.pt_buffer[:,     CONTEXT_SHIFT_MAX + s :
                                                         CONTEXT_SHIFT_MAX + s + win_size]
-        b.window          = src_beat.context_buffer[:, CONTEXT_SHIFT_MAX + s:
-                                                        CONTEXT_SHIFT_MAX + s + win_size]
+        b.window          = src_beat.context_buffer[:, win_lo : win_lo + win_size]
         b.window_pre      = WINDOW_PRE - s
         b.shift           = s
         variants.append(b)
@@ -317,7 +317,7 @@ if __name__ == '__main__':
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5), sharey=True)
     fig.suptitle('Shift augmentation — all 12 leads superimposed\n'
-                 'GT mask dashed (unshifted), shifted anchor = solid red line', fontsize=10)
+                 'GT mask = shaded region at true position  |  shifted anchor = solid red line', fontsize=10)
 
     for ax, beat in zip(axes, variants):
         mask = build_mask(beat)
