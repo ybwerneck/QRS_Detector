@@ -233,6 +233,64 @@ def plot_summary(df: pd.DataFrame, out_dir: str):
     print(f'  saved {path}')
 
 
+def plot_onset_distribution(df: pd.DataFrame, out_dir: str):
+    """Distribution of QRS onset position within the beat window (annotated beats only)."""
+    sub = df[df['qrs_onset_in_win'].notna()].copy()
+    if len(sub) == 0:
+        return
+
+    colors = {'train': '#4c72b0', 'holdout': '#dd8452'}
+    splits = [s for s in ['train', 'holdout'] if s in sub['subsplit'].unique()]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    fig.suptitle('QRS onset position within beat window', fontsize=12)
+
+    # 1. histogram of onset position (absolute sample in window)
+    ax = axes[0]
+    bins = np.arange(0, WINDOW_SIZE + 5, 5)
+    for sp in splits:
+        d = sub[sub['subsplit'] == sp]['qrs_onset_in_win']
+        ax.hist(d, bins=bins, alpha=0.55, label=f'{sp} (n={len(d)})',
+                color=colors.get(sp, 'grey'), density=True)
+    ax.axvline(sub['window_pre'].median(), color='red', lw=1, ls='--', label='median window_pre')
+    ax.set_xlabel('onset sample in window')
+    ax.set_ylabel('density')
+    ax.set_title('Onset position (abs)')
+    ax.legend(fontsize=8)
+
+    # 2. onset relative to spike (onset_in_win - window_pre), i.e. ms before R-peak
+    ax = axes[1]
+    bins_rel = np.arange(-200, 50, 2)
+    for sp in splits:
+        d_abs   = sub[sub['subsplit'] == sp]['qrs_onset_in_win']
+        wp      = sub[sub['subsplit'] == sp]['window_pre']
+        d_rel   = d_abs - wp
+        ax.hist(d_rel, bins=bins_rel, alpha=0.55, label=f'{sp} (n={len(d_rel)})',
+                color=colors.get(sp, 'grey'), density=True)
+    ax.axvline(0, color='red', lw=1, ls='--', label='R-peak (spike)')
+    ax.set_xlabel('onset relative to spike (ms)')
+    ax.set_ylabel('density')
+    ax.set_title('Onset relative to R-peak')
+    ax.legend(fontsize=8)
+
+    # 3. scatter onset_rel vs qrs_duration
+    ax = axes[2]
+    for sp in splits:
+        d = sub[sub['subsplit'] == sp].copy()
+        d['onset_rel'] = d['qrs_onset_in_win'] - d['window_pre']
+        ax.scatter(d['onset_rel'], d['qrs_gt_ms'], s=4, alpha=0.4,
+                   color=colors.get(sp, 'grey'), label=sp)
+    ax.set_xlabel('onset relative to spike (ms)')
+    ax.set_ylabel('QRS duration (ms)')
+    ax.set_title('Onset vs QRS duration')
+    ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, 'peaks_onset.png')
+    plt.savefig(path, dpi=150);  plt.close()
+    print(f'  saved {path}')
+
+
 def plot_examples(df: pd.DataFrame, all_leads_dict: dict, ys_dict: dict, out_dir: str, n: int = 16):
     """Plot 12-lead ECG (superimposed, z-scored + offset) for the most overlapping beats."""
     sub = (df[df['overlaps_any'] & df['subsplit'].isin(all_leads_dict)]
@@ -303,7 +361,7 @@ def plot_examples(df: pd.DataFrame, all_leads_dict: dict, ys_dict: dict, out_dir
 
 def plot_pt_debug(ecg_path: str, out_dir: str,
                   T0: int = 16800, T1: int = 18000,
-                  min_distance_ms: int = 150):
+                  min_distance_ms: int = 200):
     leads, _ = load_ecg(ecg_path)
     combined, delay, filt_ref, peaks_raw, thr2, refined = _pan_tompkins_detect(
         leads, min_distance_ms
@@ -377,6 +435,7 @@ def _beats_to_meta(ann_beats, unann_beats):
         window_pre           = _arr(ann_beats,  'window_pre').astype(np.int32),
         source               = _arr(ann_beats,  'source'),
         qrs_duration         = _arr(ann_beats,  'qrs_duration', np.nan).astype(np.float32),
+        qrs_start            = _arr(ann_beats,  'qrs_start',    np.nan).astype(np.float64),
         unann_spike_idx      = _arr(unann_beats, 'spike_idx').astype(np.int32),
         unann_window_pre     = _arr(unann_beats, 'window_pre').astype(np.int32),
         unann_source         = _arr(unann_beats, 'source'),
@@ -492,6 +551,10 @@ def main():
             spike_idx=meta.get('spike_idx', np.full(n, -1)).astype(int),
             qrs_gt_ms=meta.get('qrs_duration', np.full(n, np.nan)).astype(float),
             window_pre=meta.get('window_pre', np.full(n, 150)).astype(int),
+            qrs_onset_in_win=(
+                meta['qrs_start'] - (meta['spike_idx'] - meta['window_pre'])
+                if 'qrs_start' in meta else np.full(n, np.nan)
+            ),
             overlaps_any=ov['overlaps_any'],
             n_beats_in_window=ov['n_beats_in_window'],
             first_overlap_pos=ov['first_overlap_pos'],
@@ -528,6 +591,7 @@ def main():
     # ── plots ─────────────────────────────────────────────────────────────────
     print('\nPlotting...')
     plot_summary(df, args.out_dir)
+    plot_onset_distribution(df, args.out_dir)
     plot_pt_debug('data/p19_1/ecg_data.txt', args.out_dir, T0=16800,  T1=18000)
     plot_pt_debug('data/p19_1/ecg_data.txt', args.out_dir, T0=890462, T1=891662)
     plot_pt_debug('data/p19_1/ecg_data.txt', args.out_dir, T0=570619, T1=571819)
