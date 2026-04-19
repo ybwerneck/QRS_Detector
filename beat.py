@@ -332,7 +332,7 @@ def _pan_tompkins_core(
     return filtered, integrated, peaks, thr2, delay
 
 
-def detect_spikes(leads, min_distance_ms=100):
+def detect_spikes(leads, min_distance_ms=200):
     # Build combined decision variable by averaging normalised PT signals across all available leads.
     # This suppresses lead-specific noise while preserving true QRS events that appear in all leads.
     available = [n for n in PT_LEADS if n in leads]
@@ -561,7 +561,7 @@ def process_study(filepath):
 # 7. DATASET UTILITIES
 # =========================================================
 
-_BEAT_CACHE_VERSION = 5   # bump when Beat fields or save format change
+_BEAT_CACHE_VERSION = 6   # bump when Beat fields or save format change
 _FLOAT_FIELDS = ('period', 'qrs_duration', 'qrs_start', 'qt_interval', 'qt_start')
 
 
