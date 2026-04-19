@@ -168,36 +168,42 @@ def plot_summary(df: pd.DataFrame, out_dir: str):
     fig, axes = plt.subplots(2, 3, figsize=(16, 8))
     fig.suptitle('Overlapping beat analysis', fontsize=13)
 
-    # 1. n_beats_in_window distribution (histogram)
+    # 1. n_beats_in_window distribution (normalised per split)
     ax = axes[0, 0]
     for sp in splits:
         sub = df[df['split'] == sp]
-        ax.hist(sub['n_beats_in_window'], bins=range(0, sub['n_beats_in_window'].max()+2),
-                alpha=0.6, label=sp, color=colors.get(sp, 'grey'))
-    ax.set_xlabel('# other spikes in window');  ax.set_ylabel('# beats')
-    ax.set_title('Other detected spikes per window');  ax.legend(fontsize=8)
+        n_total = len(sub)
+        bins = range(0, sub['n_beats_in_window'].max() + 2)
+        counts, edges = np.histogram(sub['n_beats_in_window'], bins=bins)
+        ax.bar(edges[:-1], counts / n_total, width=0.4,
+               alpha=0.6, label=f'{sp} (n={n_total})', color=colors.get(sp, 'grey'),
+               align='edge')
+    ax.set_xlabel('# other spikes in window');  ax.set_ylabel('fraction of beats')
+    ax.set_title('Other detected spikes per window (normalised)');  ax.legend(fontsize=8)
 
     # 2. overlaps_any rate per split
     ax = axes[0, 1]
     for sp in splits:
         sub = df[df['split'] == sp]
         rate = sub['overlaps_any'].mean()
+        n_total = len(sub)
         ax.bar(sp, rate, color=colors.get(sp, 'grey'), alpha=0.8)
-        ax.text(sp, rate + 0.01, f'{rate:.1%}', ha='center', fontsize=9)
+        ax.text(sp, rate + 0.01, f'{rate:.1%}\n(n={n_total})', ha='center', fontsize=9)
     ax.set_ylabel('Fraction with ≥1 overlapping beat')
     ax.set_title('Overlap rate per split')
     ax.set_ylim(0, 1.1)
 
-    # 3. n_beats_in_window distribution
+    # 3. n_beats_in_window distribution (normalised)
     ax = axes[0, 2]
     for sp in splits:
         sub = df[df['split'] == sp]
+        n_total = len(sub)
         counts = sub['n_beats_in_window'].value_counts().sort_index()
         offset = list(splits).index(sp) * 0.25
-        ax.bar(counts.index + offset, counts.values, width=0.25,
-               label=sp, color=colors.get(sp, 'grey'), alpha=0.8)
-    ax.set_xlabel('# additional beats in window');  ax.set_ylabel('# beats')
-    ax.set_title('Additional beats per window\n(via RR period)');  ax.legend(fontsize=8)
+        ax.bar(counts.index + offset, counts.values / n_total, width=0.25,
+               label=f'{sp} (n={n_total})', color=colors.get(sp, 'grey'), alpha=0.8)
+    ax.set_xlabel('# additional beats in window');  ax.set_ylabel('fraction of beats')
+    ax.set_title('Additional beats per window (normalised)');  ax.legend(fontsize=8)
 
     # 4. distance from anchor to nearest other spike — fine bins around 100ms
     ax = axes[1, 0]
@@ -205,14 +211,18 @@ def plot_summary(df: pd.DataFrame, out_dir: str):
     bins = np.concatenate([np.arange(0, 305, 5), np.arange(325, WINDOW_SIZE + 26, 25)])
     for sp in splits:
         sub = df[(df['split'] == sp) & df['first_overlap_pos'].notna()].copy()
+        n_total = len(df[df['split'] == sp])
         sub['dist_ms'] = (sub['first_overlap_pos'] - sub['window_pre']).abs()
-        ax.hist(sub['dist_ms'], bins=bins, alpha=0.5,
-                label=sp, color=colors.get(sp, 'grey'))
+        counts, edges = np.histogram(sub['dist_ms'], bins=bins)
+        widths = np.diff(edges)
+        ax.bar(edges[:-1], counts / n_total, width=widths,
+               alpha=0.5, label=f'{sp} (n={n_total})', color=colors.get(sp, 'grey'),
+               align='edge')
     ax.axvline(100, color='red',    ls='--', lw=1, label='100ms (min_distance)')
     ax.axvline(300, color='orange', ls=':',  lw=1, label='300ms (physio min RR)')
     ax.set_xlabel('Distance from anchor spike (ms)')
-    ax.set_ylabel('# beats')
-    ax.set_title('Nearest other spike — distance from anchor')
+    ax.set_ylabel('fraction of beats')
+    ax.set_title('Nearest other spike — distance from anchor (normalised)')
     ax.legend(fontsize=8)
 
     # 5. err_ms vs first_overlap_pos
