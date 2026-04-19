@@ -31,7 +31,7 @@ def plot_grid(data, col, out_path, title_prefix):
     n_dur = len(DUR_VALS)
     fig, axes = plt.subplots(n_tv, n_dur,
                              figsize=(3.5 * n_dur, 2.8 * n_tv),
-                             sharex=False, sharey=False)
+                             sharex='col', sharey='row')
     for i, tv in enumerate(TV_VALS):
         for j, dur in enumerate(DUR_VALS):
             ax = axes[i][j]
