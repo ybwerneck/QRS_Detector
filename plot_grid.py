@@ -45,6 +45,7 @@ def plot_grid(data, col, out_path, title_prefix):
                 ax.plot(epochs, df[f'va_{col}'],  label='val',   linewidth=0.8, color='orange')
                 ax.plot(epochs, df[f'ho_{col}'],  label='ho',    linewidth=0.8, color='green')
                 ax.set_yscale('log')
+                ax.set_ylim(bottom=1e-3)
                 ax.grid(alpha=0.15)
             if i == 0:
                 ax.set_title(f'dur={dur}', fontsize=8)
