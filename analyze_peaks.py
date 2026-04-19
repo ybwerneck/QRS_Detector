@@ -27,9 +27,8 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-
-
-WINDOW_SIZE = 550   # WINDOW_PRE + WINDOW_POST
+from beat import (load_ecg, load_patient_beats, FS,
+                  WINDOW_PRE, WINDOW_POST, WINDOW_SIZE, _pan_tompkins_detect)
 
 
 # ── alignment helpers ─────────────────────────────────────────────────────────
@@ -55,56 +54,21 @@ def align_beats_to_emb(ann_decision: np.ndarray, emb_decision: np.ndarray) -> np
     return np.array(kept, dtype=np.int32)
 
 
-def load_beats_meta(beats_dir: str) -> dict:
-    """Load annotated + unannotated beat metadata + all spike positions per source."""
-    fields = ['qrs_duration', 'window_pre', 'spike_idx']
-    out = {}
-    for f in fields:
-        p = os.path.join(beats_dir, f'ann_{f}.npy')
-        if os.path.exists(p):
-            out[f] = np.load(p)
-    src_path = os.path.join(beats_dir, 'ann_source.json')
-    if os.path.exists(src_path):
-        out['source'] = np.array(json.load(open(src_path)))
-
-    # unannotated beat arrays (for overlap analysis on the unann split)
-    for f in ['window_pre', 'spike_idx']:
-        p = os.path.join(beats_dir, f'unann_{f}.npy')
-        if os.path.exists(p):
-            out[f'unann_{f}'] = np.load(p)
-    usrc_path = os.path.join(beats_dir, 'unann_source.json')
-    if os.path.exists(usrc_path):
-        out['unann_source'] = np.array(json.load(open(usrc_path)))
-
-    # all spikes in the recording (annotated + unannotated) keyed by source
-    all_spikes: dict[str, np.ndarray] = {}
-    for prefix in ('ann', 'unann'):
-        sp_path  = os.path.join(beats_dir, f'{prefix}_spike_idx.npy')
-        src_path = os.path.join(beats_dir, f'{prefix}_source.json')
-        if os.path.exists(sp_path) and os.path.exists(src_path):
-            spikes  = np.load(sp_path)
-            sources = json.load(open(src_path))
-            for sp, src in zip(spikes, sources):
-                all_spikes.setdefault(src, []).append(int(sp))
-    out['all_spikes_by_source'] = {k: np.array(sorted(v)) for k, v in all_spikes.items()}
-    return out
-
 
 # ── overlap detection ─────────────────────────────────────────────────────────
-
 def compute_overlaps(spike_idx: np.ndarray,
                      window_pre: np.ndarray,
                      source: np.ndarray,
                      all_spikes_by_source: dict) -> dict:
-    """For each annotated beat, count how many OTHER detected spikes fall inside its window.
+    """For each beat, count how many other beat windows overlap with its window.
 
-    Uses the full set of detected spikes (ann + unann) from the beats cache,
-    grouped by source recording.  No reliance on the period annotation.
+    Two windows overlap iff they share any sample:
+      beat i : [spike_i - window_pre_i, spike_i + window_post_i)
+      beat j : [spike_j - WINDOW_PRE,   spike_j + WINDOW_POST)
 
     Returns dict of arrays, all length N:
-      n_beats_in_window  int   — spikes inside (spike - window_pre, spike + window_post)
-                                 excluding the beat's own spike
-      first_overlap_pos  float — window-relative position of nearest such spike; NaN if none
+      n_beats_in_window  int   — number of other windows that overlap
+      first_overlap_pos  float — window-relative position of nearest overlapping spike; NaN if none
     """
     N          = len(spike_idx)
     window_post = WINDOW_SIZE - window_pre  # (N,)
@@ -112,21 +76,20 @@ def compute_overlaps(spike_idx: np.ndarray,
     first_pos  = np.full(N, np.nan)
 
     for i in range(N):
-        src   = source[i]
+        src    = source[i]
         all_sp = all_spikes_by_source.get(src, np.array([], dtype=np.int64))
-        lo    = spike_idx[i] - window_pre[i]
-        hi    = spike_idx[i] + window_post[i]
-        # spikes strictly inside the window, excluding self
-        inside = all_sp[(all_sp > lo) & (all_sp < hi) & (all_sp != spike_idx[i])]
-        # sanity: after cache rebuild with min_distance_ms=100, none should be < 100ms from anchor
-        too_close = np.sum(np.abs(inside - spike_idx[i]) < 100)
-        if too_close:
-            print(f'  [warn] beat {i} (src={source[i]}, spike={spike_idx[i]}): '
-                  f'{too_close} spike(s) within 100ms of anchor — stale cache?')
-        n_beats[i] = len(inside)
-        if len(inside):
-            # nearest to the anchor
-            rel = inside - lo   # position relative to window start
+        lo_i   = spike_idx[i] - window_pre[i]
+        hi_i   = spike_idx[i] + window_post[i]
+        # other beat j's window [spike_j - WINDOW_PRE, spike_j + WINDOW_POST) overlaps
+        # beat i's window [lo_i, hi_i) iff they share any sample
+        overlapping = all_sp[
+            (all_sp != spike_idx[i]) &
+            (all_sp - WINDOW_PRE < hi_i) &
+            (all_sp + WINDOW_POST > lo_i)
+        ]
+        n_beats[i] = len(overlapping)
+        if len(overlapping):
+            rel = overlapping - lo_i   # position relative to window start
             nearest = rel[np.argmin(np.abs(rel - window_pre[i]))]
             first_pos[i] = float(nearest)
 
@@ -293,7 +256,8 @@ def plot_examples(df: pd.DataFrame, all_leads_dict: dict, ys_dict: dict, out_dir
         sp   = row['subsplit']
         bidx = int(row['beat_idx'])
         ecg  = all_leads_dict[sp][bidx]   # (13, 550)
-        ys_b = ys_dict[sp][bidx, 0]       # (550,) QRS mask
+        ys_arr = ys_dict.get(sp)
+        ys_b   = ys_arr[bidx, 0] if ys_arr is not None else None
 
         # 12 ECG leads, z-scored + offset
         for li in range(12):
@@ -309,7 +273,8 @@ def plot_examples(df: pd.DataFrame, all_leads_dict: dict, ys_dict: dict, out_dir
 
         # GT QRS mask as background shading (twinx to not disturb lead scale)
         ax2 = ax.twinx()
-        ax2.fill_between(t, 0, ys_b, color='seagreen', alpha=0.2)
+        if ys_b is not None:
+            ax2.fill_between(t, 0, ys_b, color='seagreen', alpha=0.2)
         ax2.set_ylim(-0.1, 1.5);  ax2.set_yticks([])
 
         # anchor and next-beat marker
@@ -334,83 +299,141 @@ def plot_examples(df: pd.DataFrame, all_leads_dict: dict, ys_dict: dict, out_dir
     print(f'  saved {path}')
 
 
+# ── PT pipeline debug plot ───────────────────────────────────────────────────
+
+def plot_pt_debug(ecg_path: str, out_dir: str,
+                  T0: int = 16800, T1: int = 18000,
+                  min_distance_ms: int = 150):
+    leads, _ = load_ecg(ecg_path)
+    combined, delay, filt_ref, peaks_raw, thr2, refined = _pan_tompkins_detect(
+        leads, min_distance_ms
+    )
+    refined = np.array(refined)
+
+    # spikes visible in the window, each gets a distinct colour
+    visible_pt      = [p - delay for p in peaks_raw if T0 <= p - delay <= T1]
+    visible_refined = [r         for r in refined   if T0 <= r         <= T1]
+    cmap             = plt.cm.tab10(np.linspace(0, 0.9, max(len(visible_refined), 1)))
+    spike_colors     = {r: cmap[i] for i, r in enumerate(visible_refined)}
+
+    def vlines(ax, positions, ls='--'):
+        for pos in positions:
+            ax.axvline(pos, color=spike_colors.get(pos, 'grey'), lw=1, ls=ls, alpha=0.8)
+
+    t = np.arange(T0, T1)
+    fig, axes = plt.subplots(4, 1, figsize=(14, 11), sharex=True)
+    rec = os.path.basename(os.path.dirname(ecg_path))
+    fig.suptitle(f'{rec} — combined PT pipeline (min_dist={min_distance_ms}ms)', fontsize=11)
+
+    axes[0].plot(t, leads['II'][T0:T1], color='steelblue', lw=0.7)
+    axes[0].set_ylabel('Raw Lead II')
+    vlines(axes[0], visible_refined)
+
+    axes[1].plot(t, filt_ref[T0:T1], color='purple', lw=0.7)
+    axes[1].set_ylabel('Bandpass filtered\nLead II')
+    vlines(axes[1], visible_refined)
+
+    t_shifted = t - delay
+    axes[2].plot(t_shifted, combined[T0:T1], color='darkorange', lw=0.8,
+                 label='combined PT (12-lead)')
+    axes[2].axhline(thr2, color='grey', lw=0.9, ls='--', label=f'thr2={thr2:.3f}')
+    for pc in visible_pt:
+        axes[2].axvline(pc, color='steelblue', lw=1, alpha=0.6, ls=':')
+    axes[2].set_ylabel('Combined PT\n(delay-corrected)')
+    axes[2].legend(fontsize=7, loc='upper left')
+    vlines(axes[2], visible_refined)
+
+    axes[3].plot(t, filt_ref[T0:T1], color='dimgray', lw=0.7)
+    for r in visible_refined:
+        axes[3].axvline(r, color=spike_colors[r], lw=1.2, alpha=0.9,
+                        label=f'spike @{r}')
+    axes[3].set_ylabel('Refined spikes\n(Lead II filtered)')
+    axes[3].set_xlabel('time (ms)')
+    axes[3].legend(fontsize=7, loc='upper left')
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, f'pt_debug_{rec}_{T0}.png')
+    plt.savefig(path, dpi=150);  plt.close()
+    print(f'  saved {path}')
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
+
+def _beats_to_meta(ann_beats, unann_beats):
+    """Build meta dict from Beat objects (no cache)."""
+    def _arr(beats, attr, default=None):
+        vals = [getattr(b, attr) for b in beats]
+        if default is not None:
+            vals = [v if v is not None else default for v in vals]
+        return np.array(vals)
+
+    all_spikes_by_source: dict = {}
+    for b in ann_beats + unann_beats:
+        all_spikes_by_source.setdefault(b.source, []).append(b.spike_idx)
+    all_spikes_by_source = {k: np.array(sorted(v)) for k, v in all_spikes_by_source.items()}
+
+    return dict(
+        spike_idx            = _arr(ann_beats,  'spike_idx').astype(np.int32),
+        window_pre           = _arr(ann_beats,  'window_pre').astype(np.int32),
+        source               = _arr(ann_beats,  'source'),
+        qrs_duration         = _arr(ann_beats,  'qrs_duration', np.nan).astype(np.float32),
+        unann_spike_idx      = _arr(unann_beats, 'spike_idx').astype(np.int32),
+        unann_window_pre     = _arr(unann_beats, 'window_pre').astype(np.int32),
+        unann_source         = _arr(unann_beats, 'source'),
+        all_spikes_by_source = all_spikes_by_source,
+    )
+
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cache_dir',    default='cache')
+    parser.add_argument('--data_dir',     default='data')
+    parser.add_argument('--cache_dir',    default='cache',
+                        help='only used for --inf emb cache lookup')
     parser.add_argument('--out_dir',      default='results/peak_analysis')
-    parser.add_argument('--holdout_key',  default='p9')
-    parser.add_argument('--train_key',    default='p19')
-    parser.add_argument('--ckpt',         default=None,
-                        help='path to head_best_val.pt for per-beat errors')
-    parser.add_argument('--width',        type=int,   default=256)
-    parser.add_argument('--batch_size',   type=int,   default=64)
+    parser.add_argument('--holdout_pat',  default='p9',
+                        help='folder name prefix for holdout patient(s)')
+    parser.add_argument('--inf',          default=None,
+                        help='path to head checkpoint for per-beat inference (uses emb cache)')
+    parser.add_argument('--width',        type=int, default=256)
+    parser.add_argument('--batch_size',   type=int, default=64)
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # ── discover caches ───────────────────────────────────────────────────────
-    def find_emb_cache(prefix_key):
-        paths = sorted(glob.glob(os.path.join(args.cache_dir, f'emb_{prefix_key}_*_decisions.npy')))
-        non_aug = [p for p in paths if 'aug' not in os.path.basename(p)]
-        return (non_aug[0] if non_aug else paths[0]) if paths else None
+    # ── discover ECG folders ──────────────────────────────────────────────────
+    all_folders = sorted(
+        f for f in glob.glob(os.path.join(args.data_dir, '*'))
+        if os.path.isfile(os.path.join(f, 'ecg_data.txt'))
+    )
+    ho_folders = [f for f in all_folders if os.path.basename(f).startswith(args.holdout_pat)]
+    tr_folders = [f for f in all_folders if f not in ho_folders]
+    print(f'Train folders  : {[os.path.basename(f) for f in tr_folders]}')
+    print(f'Holdout folders: {[os.path.basename(f) for f in ho_folders]}')
 
-    def find_beats_dir(key):
-        candidates = sorted(glob.glob(os.path.join(args.cache_dir, f'beats_*{key}*')))
-        return candidates[0] if candidates else None
+    # ── process from scratch ──────────────────────────────────────────────────
+    print('Processing train...')
+    tr_ann, tr_unann, _ = load_patient_beats(tr_folders)
+    print('Processing holdout...')
+    ho_ann, ho_unann, _ = load_patient_beats(ho_folders)
 
-    tr_dec_path   = find_emb_cache('train')
-    ho_dec_path   = find_emb_cache('holdout')
-    un_dec_path   = find_emb_cache('unann')
-    tr_beats_dir  = find_beats_dir(args.train_key)
-    ho_beats_dir  = find_beats_dir(args.holdout_key)
+    tr_n    = len(tr_ann)
+    ho_n    = len(ho_ann)
+    un_n    = len(tr_unann)
+    tr_meta = _beats_to_meta(tr_ann, tr_unann)
+    ho_meta = _beats_to_meta(ho_ann, ho_unann)
+    tr_al   = np.stack([b.window for b in tr_ann]) if tr_ann else None
+    ho_al   = np.stack([b.window for b in ho_ann]) if ho_ann else None
 
-    for p in [tr_dec_path, ho_dec_path, tr_beats_dir, ho_beats_dir]:
-        if not p:
-            raise FileNotFoundError(f'Missing cache: {p}')
+    print(f'  annotated train   : {tr_n} beats')
+    print(f'  annotated holdout : {ho_n} beats')
+    print(f'  unannotated train : {un_n} beats')
 
-    # ── load & align ──────────────────────────────────────────────────────────
-    print('Loading and aligning caches...')
-
-    def load_split(dec_path, beats_dir):
-        base     = dec_path.replace('_decisions.npy', '')
-        emb_dec  = np.load(dec_path)
-        ys       = np.load(f'{base}_ys.npy')
-        al_path  = f'{base}_all_leads.npy'
-        all_leads = np.load(al_path) if os.path.exists(al_path) else None
-
-        meta     = load_beats_meta(beats_dir)
-        ann_dec  = np.load(os.path.join(beats_dir, 'ann_decision_window.npy'))
-        kept_idx = align_beats_to_emb(ann_dec, emb_dec)
-
-        # slice ann arrays to kept indices; leave unann_* and dict-valued entries intact
-        aligned = {k: (v[kept_idx] if isinstance(v, np.ndarray) and not k.startswith('unann_') else v)
-                   for k, v in meta.items()}
-        return emb_dec, ys, all_leads, aligned, base
-
-    tr_dec, tr_ys, tr_al, tr_meta, tr_base = load_split(tr_dec_path, tr_beats_dir)
-    ho_dec, ho_ys, ho_al, ho_meta, ho_base = load_split(ho_dec_path, ho_beats_dir)
-    print(f'  annotated train   : {tr_dec.shape[0]} beats')
-    print(f'  annotated holdout : {ho_dec.shape[0]} beats')
-
-    if tr_al is None or ho_al is None:
-        raise FileNotFoundError('all_leads cache missing')
-
-    # unannotated: align emb_unann decisions to beats-cache unann_decision_window
-    un_dec, un_meta = None, None
-    if un_dec_path:
-        emb_un_dec = np.load(un_dec_path)
-        un_beats_dec = np.load(os.path.join(tr_beats_dir, 'unann_decision_window.npy'))
-        kept_un = align_beats_to_emb(un_beats_dec, emb_un_dec)
-        un_meta = {
-            'spike_idx':           tr_meta['unann_spike_idx'][kept_un],
-            'window_pre':          tr_meta['unann_window_pre'][kept_un],
-            'source':              tr_meta['unann_source'][kept_un],
-            'all_spikes_by_source': tr_meta['all_spikes_by_source'],
-        }
-        un_dec = emb_un_dec
-        print(f'  unannotated       : {len(un_dec)} beats')
+    un_meta = dict(
+        spike_idx            = tr_meta['unann_spike_idx'],
+        window_pre           = tr_meta['unann_window_pre'],
+        source               = tr_meta['unann_source'],
+        all_spikes_by_source = tr_meta['all_spikes_by_source'],
+    ) if un_n else None
 
     # ── overlap detection ─────────────────────────────────────────────────────
     print('Computing window overlaps...')
@@ -422,20 +445,41 @@ def main():
                               un_meta['source'],    un_meta['all_spikes_by_source'])
              if un_meta else None)
 
-    # ── optional inference ────────────────────────────────────────────────────
+    # ── optional inference (emb cache required) ───────────────────────────────
     tr_errs = ho_errs = None
-    if args.ckpt:
+    if args.inf:
         from model import MaskHead
-        from beat import WINDOW_PRE as WP, WINDOW_POST as WPO
+
+        def find_emb_cache(pat):
+            paths = sorted(glob.glob(os.path.join(args.cache_dir, f'emb_{pat}_*_decisions.npy')))
+            non_aug = [p for p in paths if 'aug' not in os.path.basename(p)]
+            return (non_aug[0] if non_aug else paths[0]) if paths else None
+
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        head = MaskHead(embed_dim=768, window_size=WP + WPO, width=args.width).to(device)
-        head.load_state_dict(torch.load(args.ckpt, map_location=device))
-        print(f'Loaded head from {args.ckpt}')
-        tr_emb = tr_base + '_embs.npy'
-        ho_emb = ho_base + '_embs.npy'
-        tr_errs = infer_errors(head, tr_emb, tr_dec_path, tr_ys, device, args.batch_size)
-        ho_errs = infer_errors(head, ho_emb, ho_dec_path, ho_ys, device, args.batch_size)
-        print(f'  train mean err={tr_errs.mean():.1f}ms  holdout mean err={ho_errs.mean():.1f}ms')
+        head = MaskHead(embed_dim=768, window_size=WINDOW_SIZE, width=args.width).to(device)
+        head.load_state_dict(torch.load(args.inf, map_location=device))
+        print(f'Loaded head from {args.inf}')
+
+        tr_dec_path = find_emb_cache(args.holdout_pat + '_inv')  # train key = not holdout
+        ho_dec_path = find_emb_cache(args.holdout_pat)
+        if tr_dec_path is None or ho_dec_path is None:
+            raise FileNotFoundError('Emb cache not found; run embed first.')
+        tr_emb_path = tr_dec_path.replace('_decisions.npy', '_embs.npy')
+        ho_emb_path = ho_dec_path.replace('_decisions.npy', '_embs.npy')
+
+        tr_emb_dec = np.load(tr_dec_path)
+        ho_emb_dec = np.load(ho_dec_path)
+        tr_dec_wins = np.stack([b.decision_window for b in tr_ann if b.decision_window is not None])
+        ho_dec_wins = np.stack([b.decision_window for b in ho_ann if b.decision_window is not None])
+        tr_kept = align_beats_to_emb(tr_dec_wins, tr_emb_dec)
+        ho_kept = align_beats_to_emb(ho_dec_wins, ho_emb_dec)
+
+        dummy_ys = lambda n: np.zeros((n, 1, WINDOW_SIZE))
+        tr_errs_all = infer_errors(head, tr_emb_path, tr_dec_path, dummy_ys(len(tr_emb_dec)), device, args.batch_size)
+        ho_errs_all = infer_errors(head, ho_emb_path, ho_dec_path, dummy_ys(len(ho_emb_dec)), device, args.batch_size)
+        tr_errs = np.full(tr_n, np.nan); tr_errs[tr_kept] = tr_errs_all
+        ho_errs = np.full(ho_n, np.nan); ho_errs[ho_kept] = ho_errs_all
+        print(f'  train mean err={np.nanmean(tr_errs):.1f}ms  holdout mean err={np.nanmean(ho_errs):.1f}ms')
 
     # ── build dataframe ───────────────────────────────────────────────────────
     def make_df(split, n, meta, ov, errs, subsplit=None):
@@ -456,11 +500,11 @@ def main():
         return pd.DataFrame(rows)
 
     frames = [
-        make_df('annotated', len(tr_dec), tr_meta, tr_ov, tr_errs, subsplit='train'),
-        make_df('annotated', len(ho_dec), ho_meta, ho_ov, ho_errs, subsplit='holdout'),
+        make_df('annotated', tr_n, tr_meta, tr_ov, tr_errs, subsplit='train'),
+        make_df('annotated', ho_n, ho_meta, ho_ov, ho_errs, subsplit='holdout'),
     ]
     if un_meta is not None:
-        frames.append(make_df('unannotated', len(un_dec), un_meta, un_ov, None, subsplit='unann'))
+        frames.append(make_df('unannotated', un_n, un_meta, un_ov, None, subsplit='unann'))
     df = pd.concat(frames, ignore_index=True)
 
     csv_path = os.path.join(args.out_dir, 'peaks.csv')
@@ -484,12 +528,18 @@ def main():
     # ── plots ─────────────────────────────────────────────────────────────────
     print('\nPlotting...')
     plot_summary(df, args.out_dir)
+    plot_pt_debug('data/p19_1/ecg_data.txt', args.out_dir, T0=16800,  T1=18000)
+    plot_pt_debug('data/p19_1/ecg_data.txt', args.out_dir, T0=890462, T1=891662)
+    plot_pt_debug('data/p19_1/ecg_data.txt', args.out_dir, T0=570619, T1=571819)
+    # p7 dense-cluster regions (annotated beats @ 711815 and @ 718790, n_in_win=4)
+    plot_pt_debug('data/p7/ecg_data.txt', args.out_dir, T0=710000, T1=714000)
+    plot_pt_debug('data/p7/ecg_data.txt', args.out_dir, T0=717800, T1=720200)
     plot_examples(df,
                   {'train': tr_al, 'holdout': ho_al},
-                  {'train': tr_ys, 'holdout': ho_ys},
+                  {'train': None, 'holdout': None},
                   args.out_dir)
 
-    msg = '\nDone.' if args.ckpt else '\nDone. Add --ckpt ckpts/head_best_val.pt to populate err_ms.'
+    msg = '\nDone.' if args.inf else '\nDone. Add --inf ckpts/head_best_val.pt to populate err_ms.'
     print(msg)
 
 

@@ -7,9 +7,8 @@ import torch
 from torch.utils.data import Dataset
 from scipy.signal import resample
 
-from beat import FS, Beat, WINDOW_PRE, WINDOW_POST, CONTEXT_PRE, CONTEXT_POST, CONTEXT_SHIFT_MAX
-
-WINDOW_SIZE = WINDOW_PRE + WINDOW_POST   # 550
+from beat import (FS, Beat, WINDOW_PRE, WINDOW_POST, WINDOW_SIZE,
+                  CONTEXT_PRE, CONTEXT_POST, CONTEXT_SHIFT_MAX)
 
 # =========================================================
 # HuBERT-ECG target spec

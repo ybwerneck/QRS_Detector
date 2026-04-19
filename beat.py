@@ -6,6 +6,7 @@ from scipy.ndimage import uniform_filter1d
 FS           = 1000   # Hz  (1 sample == 1 ms)
 WINDOW_PRE   = 150     # samples before spike
 WINDOW_POST  = 400    # samples after spike  (QRS + ST + T-wave)
+WINDOW_SIZE  = WINDOW_PRE + WINDOW_POST   # 550
 
 CONTEXT_PRE  = 2500   # samples before spike for encoder context (2.5 s at 1 kHz)
 CONTEXT_POST = 2500   # samples after  spike for encoder context (2.5 s at 1 kHz)
@@ -279,7 +280,7 @@ def _pan_tompkins_core(
     fs,
     min_distance_ms=150,
     band=(5, 40),
-    integration_window=150,
+    integration_window=90,
     percentile=80,
 ):
     """
@@ -318,8 +319,7 @@ def _pan_tompkins_core(
 
     if len(peaks) > 0:
         heights = props["peak_heights"]
-        cap = np.percentile(heights, 99)
-        thr2 = 0.5 * heights[heights <= cap].mean()
+        thr2 = 0.5 * heights.mean()
 
         peaks, _ = find_peaks(
             integrated,
@@ -332,56 +332,92 @@ def _pan_tompkins_core(
     return filtered, integrated, peaks, thr2, delay
 
 
-def detect_spikes(leads, min_distance_ms=200):
-    # Build combined decision variable by averaging normalised PT signals across all available leads.
-    # This suppresses lead-specific noise while preserving true QRS events that appear in all leads.
+def _pan_tompkins_detect(leads, min_distance_ms=1000):
+    """Multi-lead Pan–Tompkins — returns all intermediate signals.
+
+    Builds a combined decision variable by z-score averaging the PT energy
+    across all PT_LEADS present in `leads`, then detects and refines peaks.
+
+    Returns
+    -------
+    combined  : 1-D array     z-score-averaged PT energy across PT_LEADS
+    delay     : int           integration delay (samples)
+    filt_ref  : 1-D array     bandpass-filtered reference lead (II or best available)
+    peaks     : 1-D int array peaks in combined signal space (before delay correction)
+    thr2      : float         adaptive threshold used for peaks
+    refined   : list[int]     peaks snapped to local R-peak in filt_ref (delay-corrected)
+    """
     available = [n for n in PT_LEADS if n in leads]
     combined = None
+    delay    = None
+    n_used   = 0
     for name in available:
-        _, integrated, _, _, delay = _pan_tompkins_core(
+        _, integrated, _, _, d = _pan_tompkins_core(
             leads[name], FS, min_distance_ms=min_distance_ms,
         )
-        # z-score normalise so each lead contributes equally regardless of amplitude
         mu, sd = integrated.mean(), integrated.std()
         if sd < 1e-9:
             continue
-        normed = (integrated - mu) / sd
+        normed   = (integrated - mu) / sd
         combined = normed if combined is None else combined + normed
+        delay    = d
+        n_used  += 1
 
     if combined is None:
         # fallback: single lead
-        combined = leads.get("II", next(iter(leads.values())))
-        _, combined, _, _, delay = _pan_tompkins_core(combined, FS, min_distance_ms=min_distance_ms)
+        sig = leads.get("II", next(iter(leads.values())))
+        _, combined, _, _, delay = _pan_tompkins_core(sig, FS, min_distance_ms=min_distance_ms)
     else:
-        combined = combined / len(available)
+        combined = combined / n_used
 
-    # Peak detection on the combined signal
     thr = np.percentile(combined, 80)
     peaks, props = find_peaks(combined, height=thr, distance=int(min_distance_ms))
     if len(peaks) > 0:
-        heights = props["peak_heights"]
-        cap = np.percentile(heights, 99)
-        thr2 = 0.5 * heights[heights <= cap].mean()
+        thr2 = 0.49 * props["peak_heights"].mean()
         peaks, _ = find_peaks(combined, height=thr2, distance=min_distance_ms)
+    else:
+        thr2 = thr
 
-    # Refine each peak back to the exact R-peak on filtered lead II (or best available)
     ref_lead = leads.get("II", leads.get("V5", next(iter(leads.values()))))
     b, a = butter(2, (5, 40), btype="band", fs=FS)
-    filtered_ref = filtfilt(b, a, ref_lead.astype(np.float64))
+    filt_ref = filtfilt(b, a, ref_lead.astype(np.float64))
 
-    search_back = 20
-    search_fwd  = 20
     refined = []
     for p in peaks:
         p_corr = p - delay
-        lo = max(0, p_corr - search_back)
-        hi = min(len(filtered_ref), p_corr + search_fwd + 1)
-        segment = filtered_ref[lo:hi]
+        lo = max(0, p_corr - 20)
+        hi = min(len(filt_ref), p_corr + 21)
         # use absolute value so inverted leads (e.g. AVR) don't break refinement
-        idx = np.argmax(np.abs(segment))
+        idx = np.argmax(np.abs(filt_ref[lo:hi]))
         refined.append(lo + idx)
 
-    return np.array(refined, dtype=int)
+    return combined, delay, filt_ref, peaks, thr2, refined
+
+
+def detect_spikes(leads, min_distance_ms=200):
+    """Detect R-peaks using combined multi-lead Pan–Tompkins.
+
+    Calls _pan_tompkins_detect then deduplicates refined peaks that ended up
+    within min_distance_ms of each other, keeping the highest-amplitude one.
+    """
+    combined, delay, filt_ref, peaks, thr2, refined = _pan_tompkins_detect(
+        leads, min_distance_ms
+    )
+
+    # post-refinement deduplication
+    refined = sorted(refined)
+    amps    = [abs(filt_ref[r]) for r in refined]
+    keep    = []
+    i = 0
+    while i < len(refined):
+        j = i + 1
+        while j < len(refined) and refined[j] - refined[i] < min_distance_ms:
+            j += 1
+        best = max(range(i, j), key=lambda k: amps[k])
+        keep.append(refined[best])
+        i = j
+
+    return np.array(keep, dtype=int)
 
 
 def pan_tompkins_signal(leads):

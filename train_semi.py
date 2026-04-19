@@ -33,8 +33,15 @@ from train_utils import (
 # Train / eval
 # =========================================================
 
+BEAT_TYPE_ORIG  = 0   # original annotated
+BEAT_TYPE_SCALE = 1   # scale-augmented
+BEAT_TYPE_SHIFT = 2   # shift-augmented
+
+
 def run_epoch(head, ann_loader, unann_iter, optimizer, device,
-              train=True, scaler=None, lambda_tv_ann=0.2, lambda_tv_unann=1.0,
+              train=True, scaler=None,
+              lambda_tv_orig=0.0, lambda_tv_scale=0.0, lambda_tv_shift=0.0,
+              lambda_tv_unann=0.0,
               lambda_dur=0.0, ann_dur_mu=None, dur_delta=100.0, collect=False):
     head.train(train)
     total_bce = total_qrs = n = 0
@@ -49,24 +56,33 @@ def run_epoch(head, ann_loader, unann_iter, optimizer, device,
             emb    = emb.to(device, non_blocking=True)
             d      = d.to(device, non_blocking=True)
             y_mask = y_mask.to(device, non_blocking=True)
+            bt     = bt.to(device, non_blocking=True)
 
+            logits, mask, _ = head(emb, d)
+            loss = F.binary_cross_entropy_with_logits(logits, y_mask[:, 0:1, :])
 
-            if(True):
-                logits, mask, _ = head(emb, d)
-                loss = (F.binary_cross_entropy_with_logits(logits, y_mask[:, 0:1, :])
-                        + lambda_tv_ann * tv_loss(logits))
-                if train:
-                    u_emb, u_d = next(unann_iter)
-                    u_logits, u_mask, u_dur = head(u_emb.to(device, non_blocking=True),
-                                                   u_d.to(device,  non_blocking=True))
+            # per-class TV on annotated batches
+            for cls, lam in ((BEAT_TYPE_ORIG,  lambda_tv_orig),
+                             (BEAT_TYPE_SCALE, lambda_tv_scale),
+                             (BEAT_TYPE_SHIFT, lambda_tv_shift)):
+                if lam > 0.0:
+                    mask_cls = (bt == cls)
+                    if mask_cls.any():
+                        loss = loss + lam * tv_loss(logits[mask_cls])
+
+            if train:
+                u_emb, u_d = next(unann_iter)
+                u_logits, u_mask, u_dur = head(u_emb.to(device, non_blocking=True),
+                                               u_d.to(device,  non_blocking=True))
+                if lambda_tv_unann > 0.0:
                     loss = loss + lambda_tv_unann * tv_loss(u_logits)
-                    if lambda_dur > 0.0 and ann_dur_mu is not None:
-                        loss = loss + lambda_dur * dur_prior_loss(
-                            u_dur[:, 0], ann_dur_mu, dur_delta)
-                    optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
-                    optimizer.step()
+                if lambda_dur > 0.0 and ann_dur_mu is not None:
+                    loss = loss + lambda_dur * dur_prior_loss(
+                        u_dur[:, 0], ann_dur_mu, dur_delta)
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
+                optimizer.step()
 
             with torch.no_grad():
                 true_dur = y_mask.sum(dim=-1)
@@ -199,7 +215,9 @@ def main(args):
         tr_bce, tr_qrs, tr_qt, *tr_c = run_epoch(
             head, train_dl, unann_iter, optimizer, device,
             train=True, scaler=scaler,
-            lambda_tv_ann=args.lambda_tv_ann,
+            lambda_tv_orig=args.lambda_tv_orig,
+            lambda_tv_scale=args.lambda_tv_scale,
+            lambda_tv_shift=args.lambda_tv_shift,
             lambda_tv_unann=args.lambda_tv_unann,
             lambda_dur=args.lambda_dur,
             ann_dur_mu=ann_dur_mu,
@@ -293,10 +311,14 @@ if __name__ == '__main__':
                         help='expand annotated training set 10x with scale+shift augmentation')
     parser.add_argument('--augment_seed',     type=int, default=42,
                         help='RNG seed for augmentation (also used as cache key)')
-    parser.add_argument('--lambda_tv_ann',    type=float, default=0.0,
-                        help='TV weight on annotated batches')
-    parser.add_argument('--lambda_tv_unann',  type=float, default=0.1,
-                        help='TV weight on unannotated batches (continuity constraint)')
+    parser.add_argument('--lambda_tv_orig',   type=float, default=0.0,
+                        help='TV weight on original annotated beats (beat_type=0)')
+    parser.add_argument('--lambda_tv_scale',  type=float, default=0.0,
+                        help='TV weight on scale-augmented beats (beat_type=1)')
+    parser.add_argument('--lambda_tv_shift',  type=float, default=0.0,
+                        help='TV weight on shift-augmented beats (beat_type=2)')
+    parser.add_argument('--lambda_tv_unann',  type=float, default=0.0,
+                        help='TV weight on natural unannotated beats')
     parser.add_argument('--lambda_dur',       type=float, default=0.01,
                         help='weight for duration prior loss on unannotated beats')
     parser.add_argument('--dur_delta',        type=float, default=70.0,
