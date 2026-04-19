@@ -310,34 +310,33 @@ if __name__ == '__main__':
         b.shift           = s
         variants.append(b)
 
-    gt_mask = build_mask(src_beat)   # ground truth from unshifted beat
-    cmap12  = plt.cm.tab20(np.linspace(0, 0.9, 12))
+    cmap12      = plt.cm.tab20(np.linspace(0, 0.9, 12))
     offset_step = 1.5
-    t_win = np.arange(WINDOW_PRE + WINDOW_POST)
+    t_win       = np.arange(WINDOW_PRE + WINDOW_POST)
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5), sharey=True)
     fig.suptitle('Shift augmentation — all 12 leads superimposed\n'
-                 'GT mask = shaded region at true position  |  shifted anchor = solid red line', fontsize=10)
+                 'GT mask tracks the shifted spike  |  dashed = unshifted reference anchor', fontsize=10)
 
     for ax, beat in zip(axes, variants):
-        mask = build_mask(beat)
+        mask = build_mask(beat)   # GT mask for THIS shifted window
         for li in range(12):
             sig = beat.window[li]
             sig_n = (sig - sig.mean()) / (sig.std() + 1e-8)
             ax.plot(t_win, sig_n + li * offset_step, color=cmap12[li], lw=0.6, alpha=0.75)
 
-        # shifted anchor (where model sees the spike)
-        ax.axvline(beat.window_pre, color='red', lw=1.2, label='shifted anchor')
+        # actual spike position in this shifted window
+        ax.axvline(beat.window_pre, color='red', lw=1.2, label='spike (shifted anchor)')
 
-        # ground-truth anchor (dashed)
-        ax.axvline(WINDOW_PRE, color='black', lw=1.0, ls='--', label='GT anchor')
+        # reference: where spike would be with zero shift
+        ax.axvline(WINDOW_PRE, color='black', lw=1.0, ls='--', label='reference (no shift)')
 
-        # GT QRS mask extent as dashed bracket on y=0 baseline
-        qrs_lo = np.argmax(gt_mask[0] > 0)
-        qrs_hi = len(gt_mask[0]) - np.argmax(gt_mask[0][::-1] > 0)
+        # GT mask for this window — tracks with the shifted spike
+        qrs_lo = np.argmax(mask[0] > 0)
+        qrs_hi = len(mask[0]) - np.argmax(mask[0][::-1] > 0)
         ax.axvspan(qrs_lo, qrs_hi, alpha=0.10, color='red',   label='GT QRS')
-        qt_lo  = np.argmax(gt_mask[1] > 0)
-        qt_hi  = len(gt_mask[1]) - np.argmax(gt_mask[1][::-1] > 0)
+        qt_lo  = np.argmax(mask[1] > 0)
+        qt_hi  = len(mask[1]) - np.argmax(mask[1][::-1] > 0)
         ax.axvspan(qt_lo,  qt_hi,  alpha=0.07, color='green', label='GT QT')
 
         ax.set_title(f'shift={beat.shift:+d}ms', fontsize=10)
