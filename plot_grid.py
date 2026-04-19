@@ -26,7 +26,7 @@ def load_metrics():
                 data[(tv, dur)] = pd.read_csv(csv)
     return data
 
-def plot_grid(data, col, out_path, title_prefix):
+def plot_grid(data, col, out_path, title_prefix, y_min=1e-3):
     n_tv  = len(TV_VALS)
     n_dur = len(DUR_VALS)
     fig, axes = plt.subplots(n_tv, n_dur,
@@ -45,7 +45,7 @@ def plot_grid(data, col, out_path, title_prefix):
                 ax.plot(epochs, df[f'va_{col}'],  label='val',   linewidth=0.8, color='orange')
                 ax.plot(epochs, df[f'ho_{col}'],  label='ho',    linewidth=0.8, color='green')
                 ax.set_yscale('log')
-                ax.set_ylim(bottom=1e-3)
+                ax.set_ylim(bottom=y_min)
                 ax.grid(alpha=0.15)
             if i == 0:
                 ax.set_title(f'dur={dur}', fontsize=8)
@@ -71,6 +71,6 @@ if __name__ == '__main__':
     os.makedirs(OUT_DIR, exist_ok=True)
     data = load_metrics()
     print(f'loaded {len(data)}/25 runs')
-    plot_grid(data, 'bce', os.path.join(OUT_DIR, 'grid_bce.png'), 'BCE')
-    plot_grid(data, 'qrs', os.path.join(OUT_DIR, 'grid_qrs.png'), 'QRS MAE (ms)')
+    plot_grid(data, 'bce', os.path.join(OUT_DIR, 'grid_bce.png'), 'BCE',          y_min=1e-2)
+    plot_grid(data, 'qrs', os.path.join(OUT_DIR, 'grid_qrs.png'), 'QRS MAE (ms)', y_min=1)
     plot_grid(data, 'qt',  os.path.join(OUT_DIR, 'grid_qt.png'),  'QT MAE (ms)')
