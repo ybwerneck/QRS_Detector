@@ -48,9 +48,10 @@ def _plot_pred_vs_target(ax_qrs, ax_qt, plot_data=None, **kwargs):
 # Error histograms
 # =========================================================
 
-def _plot_error_histograms(ax_qrs, ax_qt, plot_data=None, **kwargs):
+def _plot_error_histograms(plot_data=None, **kwargs):
+    """One row per set (train/val/holdout), one column per metric (QRS/QT)."""
     if plot_data is None:
-        return
+        return None
 
     BIN_STEP  = 5
     CLIP      = 50
@@ -59,58 +60,48 @@ def _plot_error_histograms(ax_qrs, ax_qt, plot_data=None, **kwargs):
         np.arange(-CLIP, CLIP + 1, BIN_STEP),
         [CLIP + BIN_STEP],
     ])
+    tick_pos    = (bin_edges[:-1] + bin_edges[1:]) / 2
+    tick_labels = [f'≤{-CLIP}'] + \
+                  [str(int(v)) for v in np.arange(-CLIP, CLIP, BIN_STEP)] + \
+                  [f'≥{CLIP}']
 
     sets = [
         ('train',   'steelblue'),
         ('val',     'darkorange'),
         ('holdout', 'seagreen'),
     ]
+    present = [(name, color) for name, color in sets if name in plot_data]
+    if not present:
+        return None
 
-    all_errors = {}
-    for name, _ in sets:
-        if name not in plot_data:
-            continue
+    metrics = [(0, 'QRS (ms)'), (1, 'QT (ms)')]
+    n_rows  = len(present)
+    fig, axes = plt.subplots(n_rows, 2, figsize=(12, 3.5 * n_rows), squeeze=False)
+
+    for row, (name, color) in enumerate(present):
         preds, targets = plot_data[name]
         errs = preds - targets
-        for col in (0, 1):
-            e = errs[:, col]
-            e = e[~np.isnan(e)]
-            all_errors[(name, col)] = np.clip(e, bin_edges[0], bin_edges[-1])
-
-    y_max = 0
-    for e in all_errors.values():
-        counts, _ = np.histogram(e, bins=bin_edges)
-        y_max = max(y_max, counts.max())
-    y_max = y_max * 1.15
-
-    for ax, col, label in [
-        (ax_qrs, 0, 'QRS (ms)'),
-        (ax_qt,  1, 'QT (ms)'),
-    ]:
-        for name, color in sets:
-            if (name, col) not in all_errors:
-                continue
-            e = all_errors[(name, col)]
-            ax.hist(e, bins=bin_edges, color=color, alpha=0.5,
-                    edgecolor='white', linewidth=0.4,
-                    label=f'{name}  μ={e.mean():.1f} σ={e.std():.1f}')
+        for col_idx, (col, label) in enumerate(metrics):
+            ax = axes[row, col_idx]
+            e  = errs[:, col]
+            e  = np.clip(e[~np.isnan(e)], bin_edges[0], bin_edges[-1])
+            ax.hist(e, bins=bin_edges, color=color, alpha=0.7,
+                    edgecolor='white', linewidth=0.4)
             ax.axvline(np.clip(e.mean(), bin_edges[0], bin_edges[-1]),
-                       color=color, linewidth=1.0, linestyle='--')
+                       color=color, linewidth=1.2, linestyle='--',
+                       label=f'μ={e.mean():.1f}  σ={e.std():.1f}')
+            ax.axvline(0, color='black', linewidth=0.8)
+            ax.set_xticks(tick_pos)
+            ax.set_xticklabels(tick_labels, fontsize=6, rotation=45, ha='right')
+            ax.set_xlabel(f'Error {label}  (pred − target)', fontsize=8)
+            ax.set_ylabel('Count', fontsize=8)
+            ax.set_title(f'{name} — {label}', fontsize=9)
+            ax.legend(fontsize=7)
+            ax.grid(alpha=0.2)
 
-        ax.axvline(0, color='black', linewidth=0.8)
-        ax.set_ylim(0, y_max)
-
-        tick_pos    = (bin_edges[:-1] + bin_edges[1:]) / 2
-        tick_labels = [f'≤{-CLIP}'] + \
-                      [str(int(v)) for v in np.arange(-CLIP, CLIP, BIN_STEP)] + \
-                      [f'≥{CLIP}']
-        ax.set_xticks(tick_pos)
-        ax.set_xticklabels(tick_labels, fontsize=6, rotation=45, ha='right')
-        ax.set_xlabel(f'Error {label}  (pred − target)', fontsize=8)
-        ax.set_ylabel('Count', fontsize=8)
-        ax.set_title(f'Error distribution — {label}', fontsize=9)
-        ax.legend(fontsize=7)
-        ax.grid(alpha=0.2)
+    fig.suptitle('Error distributions by split', fontsize=10)
+    plt.tight_layout()
+    return fig
 
 
 # =========================================================
@@ -308,17 +299,22 @@ def debug_plot(**kwargs):
         fig.savefig(os.path.join(out_dir, 'loss_curves.png'), dpi=120, bbox_inches='tight')
         plt.close(fig)
 
-    # ── epoch-level: scatter + histograms ─────────────────────────
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    for row, fn in enumerate([_plot_pred_vs_target, _plot_error_histograms]):
-        try:
-            fn(ax_qrs=axes[row, 0], ax_qt=axes[row, 1], **kwargs)
-        except Exception as e:
-            axes[row, 0].set_title(f'{fn.__name__} error: {e}', fontsize=7, color='red')
+    # ── epoch-level: scatter ──────────────────────────────────────
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    try:
+        _plot_pred_vs_target(ax_qrs=axes[0], ax_qt=axes[1], **kwargs)
+    except Exception as e:
+        axes[0].set_title(f'_plot_pred_vs_target error: {e}', fontsize=7, color='red')
     fig.suptitle(f'epoch {epoch}', fontsize=10)
     plt.tight_layout()
     fig.savefig(os.path.join(step_dir, 'predictions.png'), dpi=120, bbox_inches='tight')
     plt.close(fig)
+
+    # ── epoch-level: error histograms (one row per split) ─────────
+    fig = _plot_error_histograms(**kwargs)
+    if fig is not None:
+        fig.savefig(os.path.join(step_dir, 'histograms.png'), dpi=120, bbox_inches='tight')
+        plt.close(fig)
 
     # ── epoch-level: sample logits ────────────────────────────────
     fig = _plot_sample_logits(**kwargs)

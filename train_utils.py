@@ -202,6 +202,14 @@ def load_cache_unann(cache_path):
     return embs, decisions
 
 
+def load_beat_types(cache_path):
+    """Load per-beat type labels (0=original, 1=scale, 2=shift) if available, else None."""
+    path = f'{cache_path}_beat_types.npy'
+    if not os.path.exists(path):
+        return None
+    return torch.from_numpy(np.load(path).astype(np.int64))
+
+
 def load_cache_pt(cache_path):
     """Load decisions + ys only (PT baseline — no embeddings needed)."""
     for suffix in ('_decisions.npy', '_ys.npy'):

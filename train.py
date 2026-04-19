@@ -177,6 +177,7 @@ def main(args):
     best_val = float('inf')
     best_ho  = float('inf')
     history  = []
+    ckpt_path = os.path.join(args.ckpt_dir, 'head_best_val.pt')
 
     bar = tqdm(range(1, args.epochs + 1), desc='training', unit='ep')
     for epoch in bar:
@@ -186,7 +187,9 @@ def main(args):
         ho_bce, ho_qrs, ho_qt, *ho_c = run_epoch(head, holdout_dl, optimizer, device, train=False, collect=do_collect)
         scheduler.step()
 
-        best_val = min(best_val, va_qrs + va_qt)
+        if va_qrs + va_qt < best_val:
+            best_val = va_qrs + va_qt
+            torch.save(head.state_dict(), ckpt_path)
         best_ho  = min(best_ho,  ho_qrs + ho_qt)
         history.append(dict(
             epoch=epoch,

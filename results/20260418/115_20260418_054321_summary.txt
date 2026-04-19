@@ -1,0 +1,5 @@
+run_dir : runs/115_20260418_054321
+epoch   : 10000
+latest  : tr_qrs=0.0  tr_qt=0.0  va_qrs=19.6  va_qt=0.0  ho_qrs=45.9  ho_qt=0.0
+best_va : epoch=200  va_qrs=14.8  va_qt=0.0  (ho_qrs=32.9  ho_qt=0.0)
+best_ho : epoch=2121  ho_qrs=29.4  ho_qt=0.0  (va_qrs=17.4  va_qt=0.0)

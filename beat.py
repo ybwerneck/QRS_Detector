@@ -325,7 +325,6 @@ def _pan_tompkins_core(
             integrated,
             height=thr2,
             distance=min_distance_ms,
-            prominence=0.6 * np.max(integrated)
         )
     else:
         thr2 = thr1
@@ -333,29 +332,53 @@ def _pan_tompkins_core(
     return filtered, integrated, peaks, thr2, delay
 
 
-def detect_spikes(leads, min_distance_ms=200):
-    sig = leads["II"]
+def detect_spikes(leads, min_distance_ms=100):
+    # Build combined decision variable by averaging normalised PT signals across all available leads.
+    # This suppresses lead-specific noise while preserving true QRS events that appear in all leads.
+    available = [n for n in PT_LEADS if n in leads]
+    combined = None
+    for name in available:
+        _, integrated, _, _, delay = _pan_tompkins_core(
+            leads[name], FS, min_distance_ms=min_distance_ms,
+        )
+        # z-score normalise so each lead contributes equally regardless of amplitude
+        mu, sd = integrated.mean(), integrated.std()
+        if sd < 1e-9:
+            continue
+        normed = (integrated - mu) / sd
+        combined = normed if combined is None else combined + normed
 
-    filtered, _, peaks, _, delay = _pan_tompkins_core(
-        sig,
-        FS,
-        min_distance_ms=min_distance_ms,
-    )
-    #print(peaks)
+    if combined is None:
+        # fallback: single lead
+        combined = leads.get("II", next(iter(leads.values())))
+        _, combined, _, _, delay = _pan_tompkins_core(combined, FS, min_distance_ms=min_distance_ms)
+    else:
+        combined = combined / len(available)
+
+    # Peak detection on the combined signal
+    thr = np.percentile(combined, 80)
+    peaks, props = find_peaks(combined, height=thr, distance=int(min_distance_ms))
+    if len(peaks) > 0:
+        heights = props["peak_heights"]
+        cap = np.percentile(heights, 99)
+        thr2 = 0.5 * heights[heights <= cap].mean()
+        peaks, _ = find_peaks(combined, height=thr2, distance=min_distance_ms)
+
+    # Refine each peak back to the exact R-peak on filtered lead II (or best available)
+    ref_lead = leads.get("II", leads.get("V5", next(iter(leads.values()))))
+    b, a = butter(2, (5, 40), btype="band", fs=FS)
+    filtered_ref = filtfilt(b, a, ref_lead.astype(np.float64))
+
+    search_back = 20
+    search_fwd  = 20
     refined = []
-
-    search_back = 1
-    search_fwd  = 1
-
     for p in peaks:
         p_corr = p - delay
-
         lo = max(0, p_corr - search_back)
-        hi = min(len(filtered), p_corr + search_fwd)
-
-        segment = filtered[lo:hi]
-        idx = np.argmax(segment)
-
+        hi = min(len(filtered_ref), p_corr + search_fwd + 1)
+        segment = filtered_ref[lo:hi]
+        # use absolute value so inverted leads (e.g. AVR) don't break refinement
+        idx = np.argmax(np.abs(segment))
         refined.append(lo + idx)
 
     return np.array(refined, dtype=int)
@@ -447,7 +470,7 @@ def annotate_beats(beats, annotations, tol_ms=150.0):
             for ri, row in enumerate(data):
                 start, end = row[0], row[1]
                 if start - tol_ms <= t <= end + tol_ms:
-                    dist = max(0.0, start - t, t - end)  # 0 if spike inside interval
+                    dist = abs(t - start)  # closest spike to QRS onset wins
                     candidates.append((dist, bi, ri))
         candidates.sort()
         used_beats, used_rows = set(), set()
@@ -538,7 +561,7 @@ def process_study(filepath):
 # 7. DATASET UTILITIES
 # =========================================================
 
-_BEAT_CACHE_VERSION = 3   # bump when Beat fields or save format change
+_BEAT_CACHE_VERSION = 5   # bump when Beat fields or save format change
 _FLOAT_FIELDS = ('period', 'qrs_duration', 'qrs_start', 'qt_interval', 'qt_start')
 
 

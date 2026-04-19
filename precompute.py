@@ -139,6 +139,12 @@ def main(args):
         print('Encoding train+aug...')
         embs, dec, ys, al = _run_encoder(model, ds_aug, args.batch_size, device, '  train+aug')
         _save(aug_cp, embs, dec, ys, al)
+        beat_types = np.array([
+            1 if hasattr(b, 'lead_scales') else (2 if hasattr(b, 'shift') else 0)
+            for b in ds_aug.beats
+        ], dtype=np.int8)
+        _np_save_atomic(f'{aug_cp}_beat_types.npy', beat_types)
+        print(f'  beat types: orig={( beat_types==0).sum()}  scale={(beat_types==1).sum()}  shift={(beat_types==2).sum()}')
     else:
         print(f'  [skip] aug cache exists')
 

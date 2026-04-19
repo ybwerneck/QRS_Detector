@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 from train_utils import (
     dispatch_debug_plot,
-    emb_cache_path, load_cache, load_cache_unann,
+    emb_cache_path, load_cache, load_cache_unann, load_beat_types,
     collect_sample_logits,
     tv_loss, dur_prior_loss,
 )
@@ -45,7 +45,7 @@ def run_epoch(head, ann_loader, unann_iter, optimizer, device,
         best_sample = worst_sample = None
 
     with torch.set_grad_enabled(train):
-        for emb, d, y_mask, l2 in ann_loader:
+        for emb, d, y_mask, l2, bt in ann_loader:
             emb    = emb.to(device, non_blocking=True)
             d      = d.to(device, non_blocking=True)
             y_mask = y_mask.to(device, non_blocking=True)
@@ -82,10 +82,10 @@ def run_epoch(head, ann_loader, unann_iter, optimizer, device,
                 wi = errs.argmax().item()
                 if errs[bi].item() < best_err:
                     best_err = errs[bi].item()
-                    best_sample = (emb[[bi]].cpu(), d[[bi]].cpu(), y_mask[[bi]].cpu(), l2[[bi]])
+                    best_sample = (emb[[bi]].cpu(), d[[bi]].cpu(), y_mask[[bi]].cpu(), l2[[bi]], bt[[bi]])
                 if errs[wi].item() > worst_err:
                     worst_err = errs[wi].item()
-                    worst_sample = (emb[[wi]].cpu(), d[[wi]].cpu(), y_mask[[wi]].cpu(), l2[[wi]])
+                    worst_sample = (emb[[wi]].cpu(), d[[wi]].cpu(), y_mask[[wi]].cpu(), l2[[wi]], bt[[wi]])
 
             B = emb.size(0)
             total_bce += loss.item() * B
@@ -136,14 +136,18 @@ def main(args):
 
     _al_tr = all_leads    if all_leads    is not None else torch.zeros(len(embs),    13, ys.shape[-1])
     _al_ho = ho_all_leads if ho_all_leads is not None else torch.zeros(len(ho_embs), 13, ho_ys.shape[-1])
-    full_ds = TensorDataset(embs, decisions, ys, _al_tr)
+    _bt_tr = load_beat_types(train_cp)
+    if _bt_tr is None:
+        _bt_tr = torch.zeros(len(embs), dtype=torch.long)
+    full_ds = TensorDataset(embs, decisions, ys, _al_tr, _bt_tr)
     n_val   = max(1, int(len(full_ds) * args.val_split))
     n_train = len(full_ds) - n_val
     train_ds, val_ds = random_split(
         full_ds, [n_train, n_val],
         generator=torch.Generator().manual_seed(args.seed),
     )
-    holdout_full_ds = TensorDataset(ho_embs, ho_decisions, ho_ys, _al_ho)
+    _bt_ho = torch.zeros(len(ho_embs), dtype=torch.long)
+    holdout_full_ds = TensorDataset(ho_embs, ho_decisions, ho_ys, _al_ho, _bt_ho)
     unann_full_ds   = TensorDataset(unann_embs, unann_decisions)
 
     print(f'Train / Val / Holdout ({holdout_pat}) / Unannotated : '
@@ -231,12 +235,14 @@ def main(args):
                 'val':     (va_col['preds'], va_col['targets']),
                 'holdout': (ho_col['preds'], ho_col['targets']),
             }
+            _beat_type_names = {0: 'original', 1: 'scale', 2: 'shift'}
             parts, labels = [], []
             for name, col in [('train', tr_col), ('val', va_col), ('holdout', ho_col)]:
                 for tag, samp in [('best', col['best']), ('worst', col['worst'])]:
-                    e, d_s, y, l2 = samp
+                    e, d_s, y, l2, bt = samp
                     parts.append(collect_sample_logits(head, e, d_s, y, l2, device))
-                    labels.append(f'{name} ({tag})')
+                    type_str = _beat_type_names.get(int(bt.item()), '?')
+                    labels.append(f'{name} ({tag}, {type_str})')
             keys = ['logits', 'mask', 'f_sig', 'g_sig', 'decision', 'y_mask']
             sample_data = {k: np.concatenate([p[k] for p in parts], axis=0) for k in keys}
             al_parts = [p['all_leads'] for p in parts]
