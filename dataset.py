@@ -182,8 +182,9 @@ def generate_expansion_shift(beats, n, max_shift, seed):
     -------
     list[Beat]
     """
-    assert max_shift <= CONTEXT_SHIFT_MAX, \
-        f'max_shift {max_shift} exceeds CONTEXT_SHIFT_MAX {CONTEXT_SHIFT_MAX}'
+    MAX_REALISTIC_SHIFT = 50   # beyond detector jitter (±20ms refinement + margin)
+    assert max_shift <= MAX_REALISTIC_SHIFT, \
+        f'max_shift {max_shift} exceeds realistic detector jitter cap ({MAX_REALISTIC_SHIFT}ms)'
 
     context_size = CONTEXT_PRE + CONTEXT_POST
     win_size     = WINDOW_PRE  + WINDOW_POST
@@ -238,11 +239,12 @@ if __name__ == '__main__':
     fig, axes = plt.subplots(len(ann_beats), 2, figsize=(12, 3 * len(ann_beats)), sharex='col')
     t = np.arange(WINDOW_PRE + WINDOW_POST)
     for ax_row, beat in zip(axes, ann_beats):
-        mask = build_mask(beat)
-        ax_row[0].plot(t, beat.decision_window, color='steelblue')
-        ax_row[0].fill_between(t, 0, beat.decision_window.max(),
+        mask   = build_mask(beat)
+        dec_ii = beat.decision_window[1]   # Lead II PT signal
+        ax_row[0].plot(t, dec_ii, color='steelblue')
+        ax_row[0].fill_between(t, 0, dec_ii.max(),
                                where=mask[0] > 0, alpha=0.3, color='red',   label='QRS')
-        ax_row[0].fill_between(t, 0, beat.decision_window.max(),
+        ax_row[0].fill_between(t, 0, dec_ii.max(),
                                where=mask[1] > 0, alpha=0.2, color='green', label='QT')
         ax_row[0].axvline(beat.window_pre, color='k', linestyle='--', linewidth=0.8)
         ax_row[0].set_title(f'spike={beat.spike_idx}ms  |  decision + mask')
@@ -266,11 +268,12 @@ if __name__ == '__main__':
     fig, axes = plt.subplots(len(expansion), 2, figsize=(12, 3 * len(expansion)), sharex='col')
     t = np.arange(WINDOW_PRE + WINDOW_POST)
     for ax_row, beat in zip(axes, expansion):
-        mask = build_mask(beat)
-        ax_row[0].plot(t, beat.decision_window, color='steelblue')
-        ax_row[0].fill_between(t, 0, beat.decision_window.max(),
+        mask   = build_mask(beat)
+        dec_ii = beat.decision_window[1]
+        ax_row[0].plot(t, dec_ii, color='steelblue')
+        ax_row[0].fill_between(t, 0, dec_ii.max(),
                                where=mask[0] > 0, alpha=0.3, color='red',   label='QRS')
-        ax_row[0].fill_between(t, 0, beat.decision_window.max(),
+        ax_row[0].fill_between(t, 0, dec_ii.max(),
                                where=mask[1] > 0, alpha=0.2, color='green', label='QT')
         ax_row[0].axvline(beat.window_pre, color='k', linestyle='--', linewidth=0.8)
         ax_row[0].set_title(f'spike={beat.spike_idx}ms  |  decision + mask')
@@ -289,25 +292,62 @@ if __name__ == '__main__':
 
     # ── shift augmentation visual check ──────────────────────────────
     print('\n--- shift augmentation ---')
-    expansion_shift = generate_expansion_shift(ann_beats, n=5, max_shift=200, seed=0)
+    MAX_SHIFT = 30
+    src_beat  = ann_beats[0]
+    shifts    = [-MAX_SHIFT, 0, MAX_SHIFT]
+    variants  = []
+    for s in shifts:
+        b = copy.copy(src_beat)
+        win_size     = WINDOW_PRE + WINDOW_POST
+        context_size = CONTEXT_PRE + CONTEXT_POST
+        b.context_window  = src_beat.context_buffer[:, CONTEXT_SHIFT_MAX + s:
+                                                        CONTEXT_SHIFT_MAX + s + context_size]
+        b.decision_window = src_beat.pt_buffer[:,     CONTEXT_SHIFT_MAX + s:
+                                                        CONTEXT_SHIFT_MAX + s + win_size]
+        b.window          = src_beat.context_buffer[:, CONTEXT_SHIFT_MAX + s:
+                                                        CONTEXT_SHIFT_MAX + s + win_size]
+        b.window_pre      = WINDOW_PRE - s
+        b.shift           = s
+        variants.append(b)
 
-    fig, axes = plt.subplots(len(expansion_shift), 2, figsize=(12, 3 * len(expansion_shift)), sharex='col')
-    for ax_row, beat in zip(axes, expansion_shift):
+    gt_mask = build_mask(src_beat)   # ground truth from unshifted beat
+    cmap12  = plt.cm.tab20(np.linspace(0, 0.9, 12))
+    offset_step = 1.5
+    t_win = np.arange(WINDOW_PRE + WINDOW_POST)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5), sharey=True)
+    fig.suptitle('Shift augmentation — all 12 leads superimposed\n'
+                 'GT mask dashed (unshifted), shifted anchor = solid red line', fontsize=10)
+
+    for ax, beat in zip(axes, variants):
         mask = build_mask(beat)
-        ax_row[0].plot(t, beat.decision_window, color='steelblue')
-        ax_row[0].fill_between(t, 0, beat.decision_window.max(),
-                               where=mask[0] > 0, alpha=0.3, color='red',   label='QRS')
-        ax_row[0].fill_between(t, 0, beat.decision_window.max(),
-                               where=mask[1] > 0, alpha=0.2, color='green', label='QT')
-        ax_row[0].axvline(beat.window_pre, color='k', linestyle='--', linewidth=0.8)
-        ax_row[0].set_title(f'shift={beat.shift:+d}ms  |  decision + mask')
-        ax_row[0].legend(fontsize=7)
+        for li in range(12):
+            sig = beat.window[li]
+            sig_n = (sig - sig.mean()) / (sig.std() + 1e-8)
+            ax.plot(t_win, sig_n + li * offset_step, color=cmap12[li], lw=0.6, alpha=0.75)
 
-        lead_ii = beat.context_window[1]
-        ax_row[1].plot(np.linspace(0, WINDOW_PRE + WINDOW_POST, len(lead_ii)), lead_ii,
-                       color='dimgray', linewidth=0.6)
-        ax_row[1].set_title(f'shift={beat.shift:+d}ms  |  context lead II')
+        # shifted anchor (where model sees the spike)
+        ax.axvline(beat.window_pre, color='red', lw=1.2, label='shifted anchor')
 
+        # ground-truth anchor (dashed)
+        ax.axvline(WINDOW_PRE, color='black', lw=1.0, ls='--', label='GT anchor')
+
+        # GT QRS mask extent as dashed bracket on y=0 baseline
+        qrs_lo = np.argmax(gt_mask[0] > 0)
+        qrs_hi = len(gt_mask[0]) - np.argmax(gt_mask[0][::-1] > 0)
+        ax.axvspan(qrs_lo, qrs_hi, alpha=0.10, color='red',   label='GT QRS')
+        qt_lo  = np.argmax(gt_mask[1] > 0)
+        qt_hi  = len(gt_mask[1]) - np.argmax(gt_mask[1][::-1] > 0)
+        ax.axvspan(qt_lo,  qt_hi,  alpha=0.07, color='green', label='GT QT')
+
+        ax.set_title(f'shift={beat.shift:+d}ms', fontsize=10)
+        ax.set_xlabel('sample (ms)')
+        ax.set_xticks([0, WINDOW_PRE, WINDOW_PRE + WINDOW_POST])
+        ax.set_xticklabels([0, f'WP={WINDOW_PRE}', WINDOW_PRE + WINDOW_POST])
+        ax.set_yticks([])
+        ax.grid(alpha=0.1)
+
+    axes[0].legend(fontsize=7, loc='upper left')
     plt.tight_layout()
     plt.savefig('expansion_shift_check.png', dpi=120)
     print('  saved expansion_shift_check.png')
