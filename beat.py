@@ -332,7 +332,7 @@ def _pan_tompkins_core(
     return filtered, integrated, peaks, thr2, delay
 
 
-def _pan_tompkins_detect(leads, min_distance_ms=1000):
+def _pan_tompkins_detect(leads, min_distance_ms=1000, thr2_factor=0.40):
     """Multi-lead Pan–Tompkins — returns all intermediate signals.
 
     Builds a combined decision variable by z-score averaging the PT energy
@@ -373,7 +373,7 @@ def _pan_tompkins_detect(leads, min_distance_ms=1000):
     thr = np.percentile(combined, 80)
     peaks, props = find_peaks(combined, height=thr, distance=int(min_distance_ms))
     if len(peaks) > 0:
-        thr2 = 0.49 * props["peak_heights"].mean()
+        thr2 = thr2_factor * props["peak_heights"].mean()
         peaks, _ = find_peaks(combined, height=thr2, distance=min_distance_ms)
     else:
         thr2 = thr
@@ -394,14 +394,14 @@ def _pan_tompkins_detect(leads, min_distance_ms=1000):
     return combined, delay, filt_ref, peaks, thr2, refined
 
 
-def detect_spikes(leads, min_distance_ms=200):
+def detect_spikes(leads, min_distance_ms=100, thr2_factor=0.40):
     """Detect R-peaks using combined multi-lead Pan–Tompkins.
 
     Calls _pan_tompkins_detect then deduplicates refined peaks that ended up
     within min_distance_ms of each other, keeping the highest-amplitude one.
     """
     combined, delay, filt_ref, peaks, thr2, refined = _pan_tompkins_detect(
-        leads, min_distance_ms
+        leads, min_distance_ms, thr2_factor=thr2_factor
     )
 
     # post-refinement deduplication
@@ -506,7 +506,7 @@ def annotate_beats(beats, annotations, tol_ms=150.0):
             for ri, row in enumerate(data):
                 start, end = row[0], row[1]
                 if start - tol_ms <= t <= end + tol_ms:
-                    dist = abs(t - start)  # closest spike to QRS onset wins
+                    dist = abs(t - (start + end) / 2)  # closest spike to QRS midpoint wins
                     candidates.append((dist, bi, ri))
         candidates.sort()
         used_beats, used_rows = set(), set()
@@ -597,7 +597,7 @@ def process_study(filepath):
 # 7. DATASET UTILITIES
 # =========================================================
 
-_BEAT_CACHE_VERSION = 6   # bump when Beat fields or save format change
+_BEAT_CACHE_VERSION = 7   # bump when Beat fields or save format change
 _FLOAT_FIELDS = ('period', 'qrs_duration', 'qrs_start', 'qt_interval', 'qt_start')
 
 

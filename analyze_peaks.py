@@ -28,7 +28,9 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from beat import (load_ecg, load_patient_beats, FS,
-                  WINDOW_PRE, WINDOW_POST, WINDOW_SIZE, _pan_tompkins_detect)
+                  WINDOW_PRE, WINDOW_POST, WINDOW_SIZE, _pan_tompkins_detect,
+                  leads_matrix, detect_spikes, extract_windows, annotate_beats,
+                  extract_context_windows)
 
 
 # ── alignment helpers ─────────────────────────────────────────────────────────
@@ -234,56 +236,75 @@ def plot_summary(df: pd.DataFrame, out_dir: str):
 
 
 def plot_onset_distribution(df: pd.DataFrame, out_dir: str):
-    """Distribution of QRS onset position within the beat window (annotated beats only)."""
+    """Distribution of QRS onset position within the beat window (annotated beats only).
+
+    Rows = hypothetical window_pre (100, 150, 200).
+    Cols = onset abs | onset rel to spike | onset vs QRS duration.
+    """
     sub = df[df['qrs_onset_in_win'].notna()].copy()
     if len(sub) == 0:
         return
 
     colors = {'train': '#4c72b0', 'holdout': '#dd8452'}
     splits = [s for s in ['train', 'holdout'] if s in sub['subsplit'].unique()]
+    wps = [100, 150, 200]
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    fig.suptitle('QRS onset position within beat window', fontsize=12)
+    fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+    fig.suptitle('QRS onset position within beat window — by window_pre', fontsize=12)
 
-    # 1. histogram of onset position (absolute sample in window)
-    ax = axes[0]
-    bins = np.arange(0, WINDOW_SIZE + 5, 5)
-    for sp in splits:
-        d = sub[sub['subsplit'] == sp]['qrs_onset_in_win']
-        ax.hist(d, bins=bins, alpha=0.55, label=f'{sp} (n={len(d)})',
-                color=colors.get(sp, 'grey'), density=True)
-    ax.axvline(sub['window_pre'].median(), color='red', lw=1, ls='--', label='median window_pre')
-    ax.set_xlabel('onset sample in window')
-    ax.set_ylabel('density')
-    ax.set_title('Onset position (abs)')
-    ax.legend(fontsize=8)
+    for row, wp in enumerate(wps):
+        # recompute onset_in_win as if window_pre were wp
+        # current annotations use window_pre=150; shift = wp - 150
+        shift = wp - 150
+        sub['onset_adj'] = sub['qrs_onset_in_win'] + shift
+        sub['onset_rel'] = sub['onset_adj'] - wp   # relative to R-peak (always onset_in_win - 150)
 
-    # 2. onset relative to spike (onset_in_win - window_pre), i.e. ms before R-peak
-    ax = axes[1]
-    bins_rel = np.arange(-200, 50, 2)
-    for sp in splits:
-        d_abs   = sub[sub['subsplit'] == sp]['qrs_onset_in_win']
-        wp      = sub[sub['subsplit'] == sp]['window_pre']
-        d_rel   = d_abs - wp
-        ax.hist(d_rel, bins=bins_rel, alpha=0.55, label=f'{sp} (n={len(d_rel)})',
-                color=colors.get(sp, 'grey'), density=True)
-    ax.axvline(0, color='red', lw=1, ls='--', label='R-peak (spike)')
-    ax.set_xlabel('onset relative to spike (ms)')
-    ax.set_ylabel('density')
-    ax.set_title('Onset relative to R-peak')
-    ax.legend(fontsize=8)
+        # col 0: absolute onset position in window
+        ax = axes[row, 0]
+        bins_abs = np.arange(-50, WINDOW_SIZE + shift + 5, 5)
+        for sp in splits:
+            d = sub[sub['subsplit'] == sp]['onset_adj']
+            clipped = (d < 0).sum()
+            ax.hist(d, bins=bins_abs, alpha=0.55,
+                    label=f'{sp} (clipped={clipped})',
+                    color=colors.get(sp, 'grey'), density=True)
+        ax.axvline(0,  color='black', lw=1,   ls='-',  alpha=0.4, label='window start')
+        ax.axvline(wp, color='red',   lw=1,   ls='--', label=f'R-peak (wp={wp})')
+        ax.set_xlabel('onset sample in window')
+        ax.set_ylabel('density')
+        ax.set_title(f'wp={wp} — onset position (abs)')
+        ax.legend(fontsize=7)
 
-    # 3. scatter onset_rel vs qrs_duration
-    ax = axes[2]
-    for sp in splits:
-        d = sub[sub['subsplit'] == sp].copy()
-        d['onset_rel'] = d['qrs_onset_in_win'] - d['window_pre']
-        ax.scatter(d['onset_rel'], d['qrs_gt_ms'], s=4, alpha=0.4,
-                   color=colors.get(sp, 'grey'), label=sp)
-    ax.set_xlabel('onset relative to spike (ms)')
-    ax.set_ylabel('QRS duration (ms)')
-    ax.set_title('Onset vs QRS duration')
-    ax.legend(fontsize=8)
+        # col 1: onset relative to R-peak
+        ax = axes[row, 1]
+        bins_rel = np.arange(-200, 100, 2)
+        for sp in splits:
+            d_rel = sub[sub['subsplit'] == sp]['onset_rel']
+            ax.hist(d_rel, bins=bins_rel, alpha=0.55,
+                    color=colors.get(sp, 'grey'), label=sp, density=True)
+        ax.axvline(0,   color='red',   lw=1, ls='--', label='R-peak')
+        ax.axvline(-wp, color='black', lw=1, ls='-',  alpha=0.4, label='window start')
+        ax.set_xlabel('onset relative to spike (ms)')
+        ax.set_ylabel('density')
+        ax.set_title(f'wp={wp} — onset rel to R-peak')
+        ax.legend(fontsize=7)
+
+        # col 2: onset_rel vs QRS duration
+        ax = axes[row, 2]
+        for sp in splits:
+            d = sub[sub['subsplit'] == sp]
+            ok      = d['onset_adj'] >= 0
+            clipped = ~ok
+            ax.scatter(d.loc[ok,      'onset_rel'], d.loc[ok,      'qrs_gt_ms'],
+                       s=4, alpha=0.4, color=colors.get(sp, 'grey'), label=sp)
+            ax.scatter(d.loc[clipped, 'onset_rel'], d.loc[clipped, 'qrs_gt_ms'],
+                       s=10, alpha=0.8, color='red', marker='x')
+        ax.axvline(-wp, color='black', lw=1, ls='-', alpha=0.4, label='window start')
+        ax.axvline(0,   color='red',   lw=1, ls='--')
+        ax.set_xlabel('onset relative to spike (ms)')
+        ax.set_ylabel('QRS duration (ms)')
+        ax.set_title(f'wp={wp} — onset vs QRS duration  (✗=clipped)')
+        ax.legend(fontsize=7)
 
     plt.tight_layout()
     path = os.path.join(out_dir, 'peaks_onset.png')
@@ -357,6 +378,73 @@ def plot_examples(df: pd.DataFrame, all_leads_dict: dict, ys_dict: dict, out_dir
     print(f'  saved {path}')
 
 
+def plot_early_onset_cases(df: pd.DataFrame, all_leads_dict: dict, out_dir: str,
+                           onset_thresh_ms: int = -200, direction: str = 'below'):
+    """Plot all beats whose QRS onset is outside onset_thresh_ms relative to R-peak.
+
+    direction='below' : onset_rel < onset_thresh_ms  (early onset)
+    direction='above' : onset_rel > onset_thresh_ms  (late / post-R onset)
+    """
+    onset_rel = df['qrs_onset_in_win'] - df['window_pre']
+    mask = (onset_rel < onset_thresh_ms) if direction == 'below' else (onset_rel > onset_thresh_ms)
+    sub = df[df['qrs_onset_in_win'].notna() & df['subsplit'].isin(all_leads_dict) & mask].copy()
+    sub['onset_rel'] = onset_rel[sub.index]
+
+    op  = '<' if direction == 'below' else '>'
+    tag = 'early' if direction == 'below' else 'late'
+    if len(sub) == 0:
+        print(f'  no beats with onset {op} {onset_thresh_ms}ms')
+        return
+
+    cmap        = plt.cm.tab20(np.linspace(0, 0.9, 12))
+    offset_step = 1.5
+    t           = np.arange(WINDOW_SIZE)
+
+    ncols = min(4, len(sub))
+    nrows = max(1, int(np.ceil(len(sub) / ncols)))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4, nrows * 3.2), squeeze=False)
+    axes = axes.flatten()
+    fig.suptitle(f'Beats with QRS onset {op} {onset_thresh_ms}ms relative to R-peak '
+                 f'({len(sub)} total)', fontsize=11)
+
+    for ax_i, (_, row) in enumerate(sub.iterrows()):
+        ax   = axes[ax_i]
+        sp   = row['subsplit']
+        bidx = int(row['beat_idx'])
+        ecg  = all_leads_dict[sp][bidx]   # (13, 550)
+
+        for li in range(12):
+            sig   = ecg[li]
+            sig_n = (sig - sig.mean()) / (sig.std() + 1e-8)
+            ax.plot(t, sig_n + li * offset_step, color=cmap[li], lw=0.6, alpha=0.75)
+
+        stim = ecg[12]
+        if stim.any():
+            ax.plot(t, stim / (stim.max() + 1e-8) * 1.2 + 12 * offset_step,
+                    color='crimson', lw=0.8, alpha=0.9)
+
+        ax.axvline(int(row['window_pre']),      color='red',    lw=1.0, ls='--', alpha=0.7,
+                   label='R-peak')
+        ax.axvline(int(row['qrs_onset_in_win']), color='green', lw=1.0, ls='-',  alpha=0.8,
+                   label=f'onset ({row["onset_rel"]:.0f}ms)')
+
+        ax.set_title(
+            f'{row["source"]} @{row["spike_idx"]}\n'
+            f'onset={row["onset_rel"]:.0f}ms  dur={row["qrs_gt_ms"]:.0f}ms  '
+            f'split={sp}',
+            fontsize=7)
+        ax.legend(fontsize=6, loc='upper right')
+        ax.set_xticks([]);  ax.set_yticks([])
+        ax.grid(alpha=0.1)
+
+    for ax in axes[len(sub):]:
+        ax.axis('off')
+    plt.tight_layout()
+    path = os.path.join(out_dir, f'peaks_{tag}_onset.png')
+    plt.savefig(path, dpi=150);  plt.close()
+    print(f'  saved {path}')
+
+
 # ── PT pipeline debug plot ───────────────────────────────────────────────────
 
 def plot_pt_debug(ecg_path: str, out_dir: str,
@@ -411,6 +499,175 @@ def plot_pt_debug(ecg_path: str, out_dir: str,
 
     plt.tight_layout()
     path = os.path.join(out_dir, f'pt_debug_{rec}_{T0}.png')
+    plt.savefig(path, dpi=150);  plt.close()
+    print(f'  saved {path}')
+
+
+# ── thr2_factor comparison plot ──────────────────────────────────────────────
+
+def plot_thr2_comparison(ecg_path: str, spike_region: tuple, out_dir: str,
+                         factors=(0.49, 0.40, 0.35, 0.30)):
+    """PT debug plot with multiple thr2_factor values shown as stacked rows."""
+    leads, _ = load_ecg(ecg_path)
+    T0, T1   = spike_region
+    rec      = os.path.basename(os.path.dirname(ecg_path))
+
+    fig, axes = plt.subplots(len(factors), 3, figsize=(16, 3.5 * len(factors)), sharex=True)
+    fig.suptitle(f'{rec} [{T0}–{T1}] — thr2_factor comparison', fontsize=11)
+
+    import scipy.signal as _ss
+    from scipy.signal import butter, filtfilt
+    b_bp, a_bp = butter(2, (5, 40), btype='band', fs=FS)
+    ref_lead   = leads.get('II', leads.get('V5', next(iter(leads.values()))))
+    filt_ref   = filtfilt(b_bp, a_bp, ref_lead.astype(np.float64))
+
+    t = np.arange(T0, T1)
+
+    for row, factor in enumerate(factors):
+        combined, delay, _, peaks_raw, thr2, refined = _pan_tompkins_detect(
+            leads, min_distance_ms=200, thr2_factor=factor
+        )
+        refined = np.array(refined)
+        vis_ref = [r for r in refined if T0 <= r <= T1]
+        cmap    = plt.cm.tab10(np.linspace(0, 0.9, max(len(vis_ref), 1)))
+        sc      = {r: cmap[i] for i, r in enumerate(vis_ref)}
+
+        # raw lead II
+        ax = axes[row, 0]
+        ax.plot(t, ref_lead[T0:T1], color='steelblue', lw=0.7)
+        for r in vis_ref:
+            ax.axvline(r, color=sc[r], lw=1, ls='--')
+        ax.set_ylabel(f'factor={factor}\nRaw Lead II', fontsize=8)
+        if row == 0:
+            ax.set_title('Raw Lead II')
+
+        # combined PT signal
+        ax = axes[row, 1]
+        t_pt = np.arange(T0, T1) - delay
+        ax.plot(t_pt, combined[T0:T1], color='darkorange', lw=0.8)
+        ax.axhline(thr2, color='grey', lw=1, ls='--', label=f'thr2={thr2:.3f}')
+        for r in vis_ref:
+            ax.axvline(r, color=sc[r], lw=1, ls='--')
+        ax.legend(fontsize=7, loc='upper left')
+        if row == 0:
+            ax.set_title('Combined PT (delay-corrected)')
+
+        # filtered lead II + refined spikes
+        ax = axes[row, 2]
+        ax.plot(t, filt_ref[T0:T1], color='dimgray', lw=0.7)
+        for r in vis_ref:
+            ax.axvline(r, color=sc[r], lw=1.2, label=f'@{r}')
+        ax.legend(fontsize=6, loc='upper left')
+        if row == 0:
+            ax.set_title('Filtered Lead II + refined spikes')
+
+    axes[-1, 0].set_xlabel('time (ms)')
+    axes[-1, 1].set_xlabel('time (ms)')
+    axes[-1, 2].set_xlabel('time (ms)')
+    plt.tight_layout()
+    path = os.path.join(out_dir, f'thr2_cmp_{rec}_{T0}.png')
+    plt.savefig(path, dpi=150);  plt.close()
+    print(f'  saved {path}')
+
+
+# ── min_distance sweep helpers ───────────────────────────────────────────────
+
+def _load_annotated_beats(folders, min_distance_ms, thr2_factor=0.40):
+    """Run the beat pipeline with custom min_distance_ms / thr2_factor and return annotated beats."""
+    annotated = []
+    for folder in folders:
+        filepath = os.path.join(folder, 'ecg_data.txt')
+        if not os.path.isfile(filepath):
+            continue
+        try:
+            leads, annotations = load_ecg(filepath)
+            matrix, _          = leads_matrix(leads)
+            spikes              = detect_spikes(leads, min_distance_ms=min_distance_ms,
+                                               thr2_factor=thr2_factor)
+            beats               = extract_windows(matrix, spikes)
+            annotate_beats(beats, annotations)
+            extract_context_windows(matrix, beats)
+            for b in beats:
+                b.source = filepath
+            annotated.extend(b for b in beats
+                             if b.qrs_duration is not None
+                             and b.qrs_start   is not None)
+        except Exception as e:
+            print(f'  warning: {folder}: {e}')
+    return annotated
+
+
+def plot_onset_by_min_distance(folders_by_split: dict, out_dir: str,
+                                min_distances=(100, 150, 200)):
+    """3-row plot: one row per min_distance_ms, showing QRS onset distributions."""
+    colors = {'train': '#4c72b0', 'holdout': '#dd8452'}
+
+    fig, axes = plt.subplots(len(min_distances), 3, figsize=(15, 4 * len(min_distances)))
+    fig.suptitle('QRS onset distribution vs min_distance_ms (beat generator)', fontsize=12)
+
+    for row, md in enumerate(min_distances):
+        print(f'  running detector min_distance_ms={md}...')
+        beats_by_split = {sp: _load_annotated_beats(folders, md)
+                          for sp, folders in folders_by_split.items()}
+
+        # build per-split onset arrays
+        onset_data = {}
+        for sp, beats in beats_by_split.items():
+            onset_in_win = np.array([
+                b.qrs_start - (b.spike_idx - b.window_pre) for b in beats
+            ])
+            onset_rel = onset_in_win - np.array([b.window_pre for b in beats])
+            qrs_dur   = np.array([b.qrs_duration for b in beats])
+            onset_data[sp] = dict(onset_in_win=onset_in_win, onset_rel=onset_rel,
+                                  qrs_dur=qrs_dur, n=len(beats))
+
+        splits = list(onset_data.keys())
+
+        # col 0: onset position (abs)
+        ax = axes[row, 0]
+        bins_abs = np.arange(0, WINDOW_SIZE + 5, 5)
+        for sp in splits:
+            d = onset_data[sp]['onset_in_win']
+            clipped = (d < 0).sum()
+            ax.hist(d, bins=bins_abs, alpha=0.55, density=True,
+                    color=colors.get(sp, 'grey'),
+                    label=f'{sp} n={onset_data[sp]["n"]} (clipped={clipped})')
+        ax.axvline(WINDOW_PRE, color='red', lw=1, ls='--', label=f'R-peak (wp={WINDOW_PRE})')
+        ax.set_xlabel('onset sample in window')
+        ax.set_ylabel('density')
+        ax.set_title(f'min_dist={md} — onset position (abs)')
+        ax.legend(fontsize=7)
+
+        # col 1: onset relative to R-peak
+        ax = axes[row, 1]
+        bins_rel = np.arange(-200, 100, 2)
+        for sp in splits:
+            d = onset_data[sp]['onset_rel']
+            ax.hist(d, bins=bins_rel, alpha=0.55, density=True,
+                    color=colors.get(sp, 'grey'), label=f'{sp} n={onset_data[sp]["n"]}')
+        ax.axvline(0, color='red', lw=1, ls='--', label='R-peak')
+        ax.set_xlabel('onset relative to spike (ms)')
+        ax.set_ylabel('density')
+        ax.set_title(f'min_dist={md} — onset rel to R-peak')
+        ax.legend(fontsize=7)
+
+        # col 2: onset_rel vs QRS duration
+        ax = axes[row, 2]
+        for sp in splits:
+            d = onset_data[sp]
+            ok      = d['onset_in_win'] >= 0
+            ax.scatter(d['onset_rel'][ok],  d['qrs_dur'][ok],
+                       s=4, alpha=0.4, color=colors.get(sp, 'grey'), label=sp)
+            ax.scatter(d['onset_rel'][~ok], d['qrs_dur'][~ok],
+                       s=12, alpha=0.8, color='red', marker='x')
+        ax.axvline(0, color='red', lw=1, ls='--')
+        ax.set_xlabel('onset relative to spike (ms)')
+        ax.set_ylabel('QRS duration (ms)')
+        ax.set_title(f'min_dist={md} — onset vs QRS duration  (✗=clipped)')
+        ax.legend(fontsize=7)
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, 'peaks_onset_by_min_dist.png')
     plt.savefig(path, dpi=150);  plt.close()
     print(f'  saved {path}')
 
@@ -592,16 +849,37 @@ def main():
     print('\nPlotting...')
     plot_summary(df, args.out_dir)
     plot_onset_distribution(df, args.out_dir)
-    plot_pt_debug('data/p19_1/ecg_data.txt', args.out_dir, T0=16800,  T1=18000)
-    plot_pt_debug('data/p19_1/ecg_data.txt', args.out_dir, T0=890462, T1=891662)
-    plot_pt_debug('data/p19_1/ecg_data.txt', args.out_dir, T0=570619, T1=571819)
-    # p7 dense-cluster regions (annotated beats @ 711815 and @ 718790, n_in_win=4)
-    plot_pt_debug('data/p7/ecg_data.txt', args.out_dir, T0=710000, T1=714000)
-    plot_pt_debug('data/p7/ecg_data.txt', args.out_dir, T0=717800, T1=720200)
+    print('Running onset sweep over min_distance_ms...')
+    plot_onset_by_min_distance(
+        {'train': tr_folders, 'holdout': ho_folders},
+        args.out_dir,
+    )
+    # PT debug around onset outlier cases
+    outlier_cases = [
+        # late onset (>130ms)
+        ('data/p2_3/ecg_data.txt',  373806),
+        ('data/p9_1/ecg_data.txt',  300991),
+        ('data/p9_1/ecg_data.txt',  317034),
+        ('data/p9_1/ecg_data.txt',  323376),
+        ('data/p9_3/ecg_data.txt',  251972),
+        # early onset (<-200ms)
+        ('data/p9_1/ecg_data.txt',  485921),
+    ]
+    half = 800
+    for ecg_path, spike in outlier_cases:
+        plot_pt_debug(ecg_path, args.out_dir, T0=spike - half, T1=spike + half)
+
     plot_examples(df,
                   {'train': tr_al, 'holdout': ho_al},
                   {'train': None, 'holdout': None},
                   args.out_dir)
+    plot_early_onset_cases(df,
+                           {'train': tr_al, 'holdout': ho_al},
+                           args.out_dir)
+    plot_early_onset_cases(df,
+                           {'train': tr_al, 'holdout': ho_al},
+                           args.out_dir,
+                           onset_thresh_ms=130, direction='above')
 
     msg = '\nDone.' if args.inf else '\nDone. Add --inf ckpts/head_best_val.pt to populate err_ms.'
     print(msg)
