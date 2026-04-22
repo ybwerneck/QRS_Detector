@@ -59,26 +59,36 @@ def run_epoch(head, ann_loader, unann_iter, optimizer, device,
             bt     = bt.to(device, non_blocking=True)
 
             logits, mask, _ = head(emb, d)
-            loss = F.binary_cross_entropy_with_logits(logits, y_mask[:, 0:1, :])
 
-            # per-class TV on annotated batches
-            for cls, lam in ((BEAT_TYPE_ORIG,  lambda_tv_orig),
-                             (BEAT_TYPE_SCALE, lambda_tv_scale),
+            # BCE + TV on original beats (always)
+            mask_orig = (bt == BEAT_TYPE_ORIG)
+            loss = F.binary_cross_entropy_with_logits(
+                logits[mask_orig], y_mask[mask_orig, 0:1, :])
+            if mask_orig.any():
+                loss = loss + lambda_tv_orig * tv_loss(logits[mask_orig])
+
+            # Augmented beats: lambda scales both BCE and TV together
+            for cls, lam in ((BEAT_TYPE_SCALE, lambda_tv_scale),
                              (BEAT_TYPE_SHIFT, lambda_tv_shift)):
                 if lam > 0.0:
                     mask_cls = (bt == cls)
                     if mask_cls.any():
-                        loss = loss + lam * tv_loss(logits[mask_cls])
+                        loss = loss + lam * (
+                            F.binary_cross_entropy_with_logits(
+                                logits[mask_cls], y_mask[mask_cls, 0:1, :])
+                            + tv_loss(logits[mask_cls])
+                        )
 
             if train:
-                u_emb, u_d = next(unann_iter)
-                u_logits, u_mask, u_dur = head(u_emb.to(device, non_blocking=True),
-                                               u_d.to(device,  non_blocking=True))
-                if lambda_tv_unann > 0.0:
-                    loss = loss + lambda_tv_unann * tv_loss(u_logits)
-                if lambda_dur > 0.0 and ann_dur_mu is not None:
-                    loss = loss + lambda_dur * dur_prior_loss(
-                        u_dur[:, 0], ann_dur_mu, dur_delta)
+                if lambda_tv_unann > 0.0 or lambda_dur > 0.0:
+                    u_emb, u_d = next(unann_iter)
+                    u_logits, u_mask, u_dur = head(u_emb.to(device, non_blocking=True),
+                                                   u_d.to(device,  non_blocking=True))
+                    if lambda_tv_unann > 0.0:
+                        loss = loss + lambda_tv_unann * tv_loss(u_logits)
+                    if lambda_dur > 0.0 and ann_dur_mu is not None:
+                        loss = loss + lambda_dur * dur_prior_loss(
+                            u_dur[:, 0], ann_dur_mu, dur_delta)
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
@@ -311,7 +321,7 @@ if __name__ == '__main__':
                         help='expand annotated training set 10x with scale+shift augmentation')
     parser.add_argument('--augment_seed',     type=int, default=42,
                         help='RNG seed for augmentation (also used as cache key)')
-    parser.add_argument('--lambda_tv_orig',   type=float, default=0.0,
+    parser.add_argument('--lambda_tv_orig',   type=float, default=0.2,
                         help='TV weight on original annotated beats (beat_type=0)')
     parser.add_argument('--lambda_tv_scale',  type=float, default=0.0,
                         help='TV weight on scale-augmented beats (beat_type=1)')

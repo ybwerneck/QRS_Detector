@@ -36,9 +36,9 @@ from train_utils import (
 # Train / eval
 # =========================================================
 
-def run_epoch(head, loader, optimizer, device, train=True, scaler=None, lambda_tv=1.0, collect=False):
+def run_epoch(head, loader, optimizer, device, train=True, scaler=None, lambda_tv=0.0, collect=False):
     head.train(train)
-    total_bce = total_qrs = n = 0
+    total_bce = total_tv = total_qrs = n = 0
 
     if collect:
         all_preds, all_targets = [], []
@@ -54,8 +54,9 @@ def run_epoch(head, loader, optimizer, device, train=True, scaler=None, lambda_t
             if train and scaler is not None:
                 with torch.autocast(device_type=device.type):
                     logits, mask, _ = head(emb, d)
-                    loss = (F.binary_cross_entropy_with_logits(logits, y_mask[:, 0:1, :])
-                            + lambda_tv * tv_loss(logits))
+                    bce  = F.binary_cross_entropy_with_logits(logits, y_mask[:, 0:1, :])
+                    tv   = tv_loss(logits)
+                    loss = bce + lambda_tv * tv
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -64,8 +65,9 @@ def run_epoch(head, loader, optimizer, device, train=True, scaler=None, lambda_t
                 scaler.update()
             else:
                 logits, mask, _ = head(emb, d)
-                loss = (F.binary_cross_entropy_with_logits(logits, y_mask[:, 0:1, :])
-                        + lambda_tv * tv_loss(logits))
+                bce  = F.binary_cross_entropy_with_logits(logits, y_mask[:, 0:1, :])
+                tv   = tv_loss(logits)
+                loss = bce + lambda_tv * tv
                 if train:
                     optimizer.zero_grad()
                     loss.backward()
@@ -92,11 +94,12 @@ def run_epoch(head, loader, optimizer, device, train=True, scaler=None, lambda_t
                     worst_sample = (emb[[wi]].cpu(), d[[wi]].cpu(), y_mask[[wi]].cpu(), l2[[wi]])
 
             B = emb.size(0)
-            total_bce += loss.item() * B
-            total_qrs += qrs_mae     * B
+            total_bce += loss.item()  * B
+            total_tv  += tv.item()    * B
+            total_qrs += qrs_mae      * B
             n         += B
 
-    metrics = total_bce / n, total_qrs / n, 0.0
+    metrics = total_bce / n, total_tv / n, total_qrs / n, 0.0
     if not collect:
         return metrics
     return metrics + ({'preds': np.concatenate(all_preds), 'targets': np.concatenate(all_targets),
@@ -182,9 +185,9 @@ def main(args):
     bar = tqdm(range(1, args.epochs + 1), desc='training', unit='ep')
     for epoch in bar:
         do_collect = args.plot_every > 0 and (epoch % args.plot_every == 0 or epoch == args.epochs)
-        tr_bce, tr_qrs, tr_qt, *tr_c = run_epoch(head, train_dl,   optimizer, device, train=True,  scaler=scaler, collect=do_collect)
-        va_bce, va_qrs, va_qt, *va_c = run_epoch(head, val_dl,     optimizer, device, train=False, collect=do_collect)
-        ho_bce, ho_qrs, ho_qt, *ho_c = run_epoch(head, holdout_dl, optimizer, device, train=False, collect=do_collect)
+        tr_bce, tr_tv, tr_qrs, tr_qt, *tr_c = run_epoch(head, train_dl,   optimizer, device, train=True,  scaler=scaler, lambda_tv=args.lambda_tv, collect=do_collect)
+        va_bce, va_tv, va_qrs, va_qt, *va_c = run_epoch(head, val_dl,     optimizer, device, train=False, lambda_tv=args.lambda_tv, collect=do_collect)
+        ho_bce, ho_tv, ho_qrs, ho_qt, *ho_c = run_epoch(head, holdout_dl, optimizer, device, train=False, lambda_tv=args.lambda_tv, collect=do_collect)
         scheduler.step()
 
         if va_qrs + va_qt < best_val:
@@ -194,6 +197,7 @@ def main(args):
         history.append(dict(
             epoch=epoch,
             tr_bce=tr_bce, va_bce=va_bce, ho_bce=ho_bce,
+            tr_tv=tr_tv,   va_tv=va_tv,   ho_tv=ho_tv,
             tr_qrs=tr_qrs, va_qrs=va_qrs, ho_qrs=ho_qrs,
             tr_qt=tr_qt,   va_qt=va_qt,   ho_qt=ho_qt,
         ))
@@ -237,9 +241,9 @@ def main(args):
         if epoch % args.log_every == 0 or epoch == args.epochs:
             tqdm.write(
                 f'[{epoch:04d}]  '
-                f'train bce={tr_bce:.4f}  qrs={tr_qrs:.1f}  qt={tr_qt:.1f}  '
-                f'val qrs={va_qrs:.1f}  qt={va_qt:.1f}  '
-                f'holdout({holdout_pat}) qrs={ho_qrs:.1f}  qt={ho_qt:.1f}  '
+                f'train bce={tr_bce:.4f}  tv={tr_tv:.4f}  qrs={tr_qrs:.1f}  '
+                f'val bce={va_bce:.4f}  tv={va_tv:.4f}  qrs={va_qrs:.1f}  '
+                f'holdout({holdout_pat}) bce={ho_bce:.4f}  tv={ho_tv:.4f}  qrs={ho_qrs:.1f}  '
                 f'lr={scheduler.get_last_lr()[0]:.2e}'
             )
 
@@ -268,5 +272,7 @@ if __name__ == '__main__':
                         help='expand training set 10x with scale+shift augmentation')
     parser.add_argument('--augment_seed',    type=int, default=42,
                         help='RNG seed for augmentation (also used as cache key)')
+    parser.add_argument('--lambda_tv',       type=float, default=0.0,
+                        help='TV regularisation weight on annotated beat logits')
     args = parser.parse_args()
     main(args)

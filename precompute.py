@@ -101,7 +101,7 @@ def main(args):
 
     n_aug       = int(len(train_ann) * 4.5)
     scale_beats = generate_expansion_scale(train_ann, n=n_aug, seed=args.augment_seed)
-    shift_beats = generate_expansion_shift(train_ann, n=n_aug, max_shift=30,
+    shift_beats = generate_expansion_shift(train_ann, n=n_aug, max_shift=100,
                                            seed=args.augment_seed + 1)
     train_aug   = train_ann + scale_beats + shift_beats
     print(f'  augmented: {len(train_ann)} → {len(train_aug)} (+{n_aug} scale, +{n_aug} shift)')

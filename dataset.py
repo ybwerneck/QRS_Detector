@@ -181,7 +181,7 @@ def generate_expansion_shift(beats, n, max_shift, seed):
     -------
     list[Beat]
     """
-    MAX_REALISTIC_SHIFT = 50   # beyond detector jitter (±20ms refinement + margin)
+    MAX_REALISTIC_SHIFT = 100  # beyond detector jitter (±20ms refinement + margin)
     assert max_shift <= MAX_REALISTIC_SHIFT, \
         f'max_shift {max_shift} exceeds realistic detector jitter cap ({MAX_REALISTIC_SHIFT}ms)'
 
@@ -197,12 +197,12 @@ def generate_expansion_shift(beats, n, max_shift, seed):
         s   = int(rng.integers(-max_shift, max_shift + 1))
 
         beat = copy.copy(src)
+        win_lo = CONTEXT_PRE + CONTEXT_SHIFT_MAX - WINDOW_PRE + s  # spike at WINDOW_PRE in slice
         beat.context_window  = src.context_buffer[:, CONTEXT_SHIFT_MAX + s :
                                                       CONTEXT_SHIFT_MAX + s + context_size]
         beat.decision_window = src.pt_buffer[:, CONTEXT_SHIFT_MAX + s :
                                                CONTEXT_SHIFT_MAX + s + win_size]
-        beat.window          = src.context_buffer[:, CONTEXT_SHIFT_MAX + s :
-                                                      CONTEXT_SHIFT_MAX + s + win_size]
+        beat.window          = src.context_buffer[:, win_lo : win_lo + win_size]
         beat.window_pre      = WINDOW_PRE - s
         beat.shift           = s   # for inspection
         synthetic.append(beat)
