@@ -18,7 +18,7 @@ import argparse
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.data import DataLoader, TensorDataset, Subset
 from tqdm import tqdm
 
 from train_utils import (
@@ -123,6 +123,7 @@ def run_epoch(head, ann_loader, unann_iter, optimizer, device,
         return metrics
     return metrics + ({'preds': np.concatenate(all_preds), 'targets': np.concatenate(all_targets),
                        'best': best_sample, 'worst': worst_sample},)
+from torch.utils.data import TensorDataset
 
 
 # =========================================================
@@ -165,13 +166,41 @@ def main(args):
     _bt_tr = load_beat_types(train_cp)
     if _bt_tr is None:
         _bt_tr = torch.zeros(len(embs), dtype=torch.long)
+
     full_ds = TensorDataset(embs, decisions, ys, _al_tr, _bt_tr)
-    n_val   = max(1, int(len(full_ds) * args.val_split))
-    n_train = len(full_ds) - n_val
-    train_ds, val_ds = random_split(
-        full_ds, [n_train, n_val],
-        generator=torch.Generator().manual_seed(args.seed),
-    )
+
+    # Split by parent group so augmented children always follow their original.
+    # parent_idx: -1 for original beats, index-into-originals for augmented.
+    parent_idx_path = f'{train_cp}_parent_idx.npy'
+    parent = torch.from_numpy(np.load(parent_idx_path)).long()
+    # map originals to themselves
+    parent = parent.clone()
+    orig_pos = torch.where(parent == -1)[0]
+    parent[orig_pos] = orig_pos
+
+    unique_roots = torch.unique(parent[orig_pos])  # original beat indices
+    n_total = len(unique_roots)
+    n_val   = max(1, int(n_total * args.val_split))
+    perm    = torch.randperm(n_total,
+                             generator=torch.Generator().manual_seed(args.seed))
+    val_roots   = unique_roots[perm[:n_val]]
+    train_roots = unique_roots[perm[n_val:]]
+
+    is_val  = torch.isin(parent, val_roots)
+    train_idx = torch.where(~is_val)[0]
+    val_idx   = torch.where(is_val)[0]
+
+    # val contains only the original beats in the held-out group
+    val_idx = val_idx[_bt_tr[val_idx] == BEAT_TYPE_ORIG]
+
+    train_ds = Subset(full_ds, train_idx.tolist())
+    val_ds   = Subset(full_ds, val_idx.tolist())
+
+    n_orig_train = int((_bt_tr[train_idx] == BEAT_TYPE_ORIG).sum())
+    n_aug_train  = len(train_idx) - n_orig_train
+    print(f'  train={len(train_ds)} (orig={n_orig_train} aug={n_aug_train})  val={len(val_ds)} (orig only)')
+
+
     _bt_ho = torch.zeros(len(ho_embs), dtype=torch.long)
     holdout_full_ds = TensorDataset(ho_embs, ho_decisions, ho_ys, _al_ho, _bt_ho)
     unann_full_ds   = TensorDataset(unann_embs, unann_decisions)

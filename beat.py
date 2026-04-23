@@ -33,6 +33,7 @@ class Beat:
         self.window       = window             # (n_leads, window_size)
         self.window_pre   = WINDOW_PRE         # samples before spike in window
         self.window_post  = WINDOW_POST        # actual signal samples after spike (excl. zero-padding)
+        self.paraent=-1            # index of the parent window in the original signal, used for data augmentation   -1 if original
 
         self.label        = None               # 0=normal 1=arrhythmia 2=extrasystole
         self.period       = None               # RR interval ms

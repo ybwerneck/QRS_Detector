@@ -144,7 +144,15 @@ def main(args):
             for b in ds_aug.beats
         ], dtype=np.int8)
         _np_save_atomic(f'{aug_cp}_beat_types.npy', beat_types)
-        print(f'  beat types: orig={( beat_types==0).sum()}  scale={(beat_types==1).sum()}  shift={(beat_types==2).sum()}')
+        print(f'  beat types: orig={(beat_types==0).sum()}  scale={(beat_types==1).sum()}  shift={(beat_types==2).sum()}')
+        # parent_idx: -1 for originals, index-into-train_ann for augmented
+        n_orig = len(train_ann)
+        parent_idx = np.full(len(ds_aug.beats), -1, dtype=np.int64)
+        for i, b in enumerate(ds_aug.beats):
+            if i >= n_orig:
+                parent_idx[i] = getattr(b, 'parent', -1)
+        _np_save_atomic(f'{aug_cp}_parent_idx.npy', parent_idx)
+        print(f'  parent_idx saved ({(parent_idx == -1).sum()} roots)')
     else:
         print(f'  [skip] aug cache exists')
 
@@ -172,6 +180,6 @@ if __name__ == '__main__':
     parser.add_argument('--holdout_patient', default='p9')
     parser.add_argument('--augment_seed',    type=int, default=42)
     parser.add_argument('--batch_size',      type=int, default=32)
-    parser.add_argument('--force',           action='store_true')
+    parser.add_argument('--force', '-f',     action='store_true')
     args = parser.parse_args()
     main(args)

@@ -145,15 +145,19 @@ def generate_expansion_scale(beats, n, seed):
     -------
     list[Beat]
     """
-    rng       = np.random.default_rng(seed)
-    src_beats = [b for b in beats if getattr(b, 'context_buffer', None) is not None]
+    rng         = np.random.default_rng(seed)
+    src_indices = [i for i, b in enumerate(beats)
+                   if getattr(b, 'context_buffer', None) is not None]
+    src_beats   = [beats[i] for i in src_indices]
 
     synthetic = []
     for _ in range(n):
-        src    = src_beats[rng.integers(len(src_beats))]
-        scales = rng.uniform(0.6, 2.0, size=(src.context_buffer.shape[0], 1))  # (n_leads, 1)
+        idb    = rng.integers(len(src_beats))
+        src    = src_beats[idb]
+        scales = rng.uniform(0.6, 2.0, size=(src.context_buffer.shape[0], 1))
 
         beat = copy.copy(src)
+        beat.parent          = src_indices[idb]  # index into input beats list
         beat.context_buffer  = src.context_buffer * scales
         beat.context_window  = src.context_window * scales
         beat.window          = src.window * scales  # keep display window aligned
@@ -187,16 +191,20 @@ def generate_expansion_shift(beats, n, max_shift, seed):
 
     context_size = CONTEXT_PRE + CONTEXT_POST
     win_size     = WINDOW_PRE  + WINDOW_POST
-    rng          = np.random.default_rng(seed)
-    src_beats    = [b for b in beats if getattr(b, 'context_buffer', None) is not None
-                    and getattr(b, 'pt_buffer', None) is not None]
+    rng         = np.random.default_rng(seed)
+    src_indices = [i for i, b in enumerate(beats)
+                   if getattr(b, 'context_buffer', None) is not None
+                   and getattr(b, 'pt_buffer', None) is not None]
+    src_beats   = [beats[i] for i in src_indices]
 
     synthetic = []
     for _ in range(n):
-        src = src_beats[rng.integers(len(src_beats))]
+        idb = rng.integers(len(src_beats))
+        src = src_beats[idb]
         s   = int(rng.integers(-max_shift, max_shift + 1))
 
         beat = copy.copy(src)
+        beat.parent = src_indices[idb]  # index into input beats list
         win_lo = CONTEXT_PRE + CONTEXT_SHIFT_MAX - WINDOW_PRE + s  # spike at WINDOW_PRE in slice
         beat.context_window  = src.context_buffer[:, CONTEXT_SHIFT_MAX + s :
                                                       CONTEXT_SHIFT_MAX + s + context_size]
