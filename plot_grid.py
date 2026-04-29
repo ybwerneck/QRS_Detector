@@ -9,8 +9,8 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-RUNS_DIR = 'grids/tv_scale_shift_sweep_20260421_225521/runs/'
-OUT_DIR  = 'grids/tv_scale_shift_sweep_20260421_225521/results'
+RUNS_DIR = 'grids/base_grid/runs/'
+OUT_DIR  = 'grids/base_grid/results'
 
 
 # -----------------------------
